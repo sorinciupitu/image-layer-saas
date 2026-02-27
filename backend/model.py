@@ -120,7 +120,14 @@ class LayerDecompositionModel:
 
         try:
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
-        except TypeError:
+        except Exception as exc:
+            if "variant" not in load_kwargs:
+                raise
+            LOGGER.warning(
+                "Failed to load model with variant=%s (%s). Retrying without variant.",
+                load_kwargs.get("variant"),
+                exc,
+            )
             load_kwargs.pop("variant", None)
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
 
