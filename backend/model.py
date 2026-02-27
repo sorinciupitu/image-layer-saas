@@ -15,6 +15,11 @@ from PIL import Image
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_MODEL_ID = os.getenv("HF_MODEL_ID", "Qwen/Qwen-Image-Layered")
+ENABLE_HEURISTIC_FALLBACK = os.getenv("ENABLE_HEURISTIC_FALLBACK", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,7 @@ class LayerDecompositionModel:
         self._load_lock = threading.Lock()
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._dtype = torch.float16 if self._device == "cuda" else torch.float32
+        self._allow_fallback = ENABLE_HEURISTIC_FALLBACK
 
     @classmethod
     def instance(cls, model_id: str = DEFAULT_MODEL_ID) -> "LayerDecompositionModel":
@@ -79,15 +85,25 @@ class LayerDecompositionModel:
             self.ensure_loaded()
             layers = self._run_model_inference(rgba_image, num_layers)
         except Exception as exc:
-            LOGGER.exception("Model inference failed; using deterministic fallback: %s", exc)
-            layers = self._fallback_decompose(rgba_image, num_layers)
+            if self._allow_fallback:
+                LOGGER.exception("Model inference failed; using deterministic fallback: %s", exc)
+                layers = self._fallback_decompose(rgba_image, num_layers)
+            else:
+                LOGGER.exception("Model inference failed (fallback disabled): %s", exc)
+                raise RuntimeError(f"Qwen-Image-Layered inference failed: {exc}") from exc
 
         elapsed = time.perf_counter() - started_at
         LOGGER.info("Image decomposition completed in %.2fs (layers=%d)", elapsed, len(layers))
         return layers
 
     def _load_pipeline(self) -> Any:
-        from diffusers import DiffusionPipeline, QwenImageLayeredPipeline
+        try:
+            from diffusers import QwenImageLayeredPipeline
+        except Exception as exc:
+            raise RuntimeError(
+                "QwenImageLayeredPipeline is unavailable. Install latest diffusers from GitHub "
+                "or a compatible release with Qwen-Image-Layered support."
+            ) from exc
 
         load_kwargs: dict[str, Any] = {
             "torch_dtype": self._dtype,
@@ -100,9 +116,9 @@ class LayerDecompositionModel:
 
         try:
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
-        except Exception:
+        except TypeError:
             load_kwargs.pop("variant", None)
-            pipeline = DiffusionPipeline.from_pretrained(self.model_id, **load_kwargs)
+            pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
 
         if self._device == "cuda":
             pipeline.to("cuda")
@@ -179,6 +195,10 @@ class LayerDecompositionModel:
         return kwargs
 
     def _extract_layers(self, output: Any) -> list[Image.Image]:
+        direct_layers = self._coerce_layer_list(getattr(output, "images", None))
+        if direct_layers:
+            return direct_layers
+
         candidates: list[Any] = []
         self._collect_candidates(output, candidates)
 
@@ -190,7 +210,38 @@ class LayerDecompositionModel:
                 for sub_item in item:
                     if isinstance(sub_item, Image.Image):
                         layer_images.append(sub_item.convert("RGBA"))
+        direct_from_candidates = self._coerce_layer_list(candidates)
+        if direct_from_candidates:
+            return direct_from_candidates
         return layer_images
+
+    def _coerce_layer_list(self, value: Any) -> list[Image.Image]:
+        if value is None:
+            return []
+        if isinstance(value, Image.Image):
+            return [value.convert("RGBA")]
+        if not isinstance(value, (list, tuple)):
+            return []
+        if not value:
+            return []
+
+        if all(isinstance(item, Image.Image) for item in value):
+            return [item.convert("RGBA") for item in value]
+
+        if len(value) == 1 and isinstance(value[0], (list, tuple)):
+            nested = value[0]
+            if all(isinstance(item, Image.Image) for item in nested):
+                return [item.convert("RGBA") for item in nested]
+
+        flattened: list[Image.Image] = []
+        for item in value:
+            if isinstance(item, Image.Image):
+                flattened.append(item.convert("RGBA"))
+            elif isinstance(item, (list, tuple)):
+                for sub_item in item:
+                    if isinstance(sub_item, Image.Image):
+                        flattened.append(sub_item.convert("RGBA"))
+        return flattened
 
     def _collect_candidates(self, value: Any, sink: list[Any]) -> None:
         if value is None:
@@ -217,13 +268,46 @@ class LayerDecompositionModel:
         size: tuple[int, int],
         expected_layers: int,
     ) -> list[Image.Image]:
-        normalized: list[Image.Image] = [layer.convert("RGBA").resize(size) for layer in layers]
+        normalized: list[Image.Image] = [self._resize_to_canvas(layer.convert("RGBA"), size) for layer in layers]
+        if len(normalized) == 1:
+            split_layers = self._split_if_tiled(normalized[0], size, expected_layers)
+            if split_layers:
+                normalized = split_layers
+
         if len(normalized) >= expected_layers:
             return normalized[:expected_layers]
 
         while len(normalized) < expected_layers:
             normalized.append(Image.new("RGBA", size, (0, 0, 0, 0)))
         return normalized
+
+    def _resize_to_canvas(self, image: Image.Image, size: tuple[int, int]) -> Image.Image:
+        if image.size == size:
+            return image
+        return image.resize(size, Image.Resampling.LANCZOS)
+
+    def _split_if_tiled(
+        self,
+        image: Image.Image,
+        size: tuple[int, int],
+        expected_layers: int,
+    ) -> list[Image.Image]:
+        width, height = image.size
+        canvas_w, canvas_h = size
+
+        if width == canvas_w * expected_layers and height == canvas_h:
+            return [
+                image.crop((canvas_w * idx, 0, canvas_w * (idx + 1), canvas_h)).convert("RGBA")
+                for idx in range(expected_layers)
+            ]
+
+        if height == canvas_h * expected_layers and width == canvas_w:
+            return [
+                image.crop((0, canvas_h * idx, canvas_w, canvas_h * (idx + 1))).convert("RGBA")
+                for idx in range(expected_layers)
+            ]
+
+        return []
 
     def _fallback_decompose(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
         width, height = image.size
