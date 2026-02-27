@@ -79,12 +79,12 @@ async def health() -> dict[str, Any]:
     }
 
 
-@app.post("/api/decompose")
+@app.post("/api/decompose", response_model=None)
 async def decompose(
     request: Request,
     image: UploadFile = File(...),
     num_layers: int = Form(default=4),
-) -> FileResponse | JSONResponse:
+) -> Response:
     _validate_num_layers(num_layers=num_layers)
     _validate_upload_metadata(upload=image)
 
