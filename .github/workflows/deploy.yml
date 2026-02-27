@@ -1,0 +1,155 @@
+name: Auto Deploy (WSL2)
+
+# -----------------------------------------------------------------------------
+# Setup Guide: Self-hosted Runner on Windows + WSL2
+#
+# 1) Install runner binaries:
+#    - In GitHub repo: Settings -> Actions -> Runners -> New self-hosted runner.
+#    - Choose Linux x64 because this job is intended to run in WSL2 Ubuntu.
+#
+# 2) Configure runner to execute inside WSL2 (recommended):
+#    - Open WSL2 Ubuntu shell.
+#    - Create runner folder in WSL filesystem (example: /home/<user>/actions-runner).
+#    - Download and configure runner there using GitHub's commands.
+#    - Start runner from WSL2 (or install as service inside WSL2).
+#    - This gives runner labels such as: self-hosted, linux, x64.
+#
+# 3) Add required repository secrets:
+#    - DEPLOY_PATH: absolute WSL path to deployed repo
+#      Example: /home/username/image-layer-saas
+#    - ENV_FILE_PATH: absolute path to real .env on server
+#      Example: /home/username/secure/image-layer-saas.env
+#    - HEALTH_CHECK_URL: API health endpoint
+#      Example: http://localhost:8000/api/health
+#
+# 4) Optional notification secret:
+#    - DEPLOY_NOTIFY_WEBHOOK: webhook URL (Slack/Discord/Teams) for failure alerts.
+#
+# 5) Verify runner is online:
+#    - GitHub repo -> Settings -> Actions -> Runners.
+#    - Status must show "Idle" or "Online" for the WSL2 runner.
+# -----------------------------------------------------------------------------
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    name: Deploy To Server
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+    env:
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      ENV_FILE_PATH: ${{ secrets.ENV_FILE_PATH }}
+      HEALTH_CHECK_URL: ${{ secrets.HEALTH_CHECK_URL }}
+      DEPLOY_NOTIFY_WEBHOOK: ${{ secrets.DEPLOY_NOTIFY_WEBHOOK }}
+      REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      API_URL: ${{ github.api_url }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$DEPLOY_PATH" ] || { echo "Missing DEPLOY_PATH secret"; exit 1; }
+          [ -n "$ENV_FILE_PATH" ] || { echo "Missing ENV_FILE_PATH secret"; exit 1; }
+          [ -n "$HEALTH_CHECK_URL" ] || { echo "Missing HEALTH_CHECK_URL secret"; exit 1; }
+          [ -d "$DEPLOY_PATH" ] || { echo "DEPLOY_PATH does not exist: $DEPLOY_PATH"; exit 1; }
+          [ -f "$ENV_FILE_PATH" ] || { echo "ENV_FILE_PATH does not exist: $ENV_FILE_PATH"; exit 1; }
+
+      - name: Pull latest code from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          git fetch origin main
+          git checkout main
+          git pull origin main
+
+      - name: Copy production environment file
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "$ENV_FILE_PATH" "$DEPLOY_PATH/.env"
+
+      - name: Restart containers with rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$DEPLOY_PATH"
+          docker compose down
+          docker compose up --build -d
+
+      - name: Wait for backend health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 180))
+          while true; do
+            status_code="$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_CHECK_URL" || true)"
+            if [ "$status_code" = "200" ]; then
+              echo "Health check passed: $HEALTH_CHECK_URL"
+              break
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Health check failed after 180 seconds. Last status: ${status_code:-none}"
+              exit 1
+            fi
+            sleep 5
+          done
+
+      - name: Comment success on commit
+        if: success()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          body="[SUCCESS] Deployment succeeded for commit ${SHA}. Workflow: ${RUN_URL}"
+          payload="$(printf '{"body":"%s"}' "$(echo "$body" | sed 's/"/\\"/g')")"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "${API_URL}/repos/${REPO}/commits/${SHA}/comments" \
+            -d "$payload" >/dev/null
+
+      - name: Comment failure on commit
+        if: failure()
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          body="[FAILURE] Deployment failed for commit ${SHA}. Workflow: ${RUN_URL}"
+          payload="$(printf '{"body":"%s"}' "$(echo "$body" | sed 's/"/\\"/g')")"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "${API_URL}/repos/${REPO}/commits/${SHA}/comments" \
+            -d "$payload" >/dev/null
+
+      - name: Send failure notification
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          message="Image layer SaaS deploy failed for ${REPO}@${SHA}. Workflow: ${RUN_URL}"
+          if [ -n "${DEPLOY_NOTIFY_WEBHOOK:-}" ]; then
+            payload="$(printf '{"text":"%s"}' "$(echo "$message" | sed 's/"/\\"/g')")"
+            curl -sS -X POST \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "$DEPLOY_NOTIFY_WEBHOOK" >/dev/null
+            echo "Failure notification sent via webhook."
+          else
+            echo "DEPLOY_NOTIFY_WEBHOOK is not set. Skipping external notification."
+            echo "::warning::Deployment failed. Add DEPLOY_NOTIFY_WEBHOOK secret to enable external alerts."
+          fi

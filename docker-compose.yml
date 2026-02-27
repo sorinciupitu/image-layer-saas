@@ -1,0 +1,98 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        PRELOAD_MODEL: ${PRELOAD_MODEL:-false}
+        MODEL_ID: ${HF_MODEL_ID:-Qwen/Qwen-Image-Layered}
+    container_name: image-layer-backend
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
+      HF_MODEL_ID: ${HF_MODEL_ID:-Qwen/Qwen-Image-Layered}
+      REQUEST_TIMEOUT_SECONDS: ${REQUEST_TIMEOUT_SECONDS:-120}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-20}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/tmp/output}
+      OUTPUT_RETENTION_SECONDS: ${OUTPUT_RETENTION_SECONDS:-3600}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - output_data:/tmp/output
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+    runtime: nvidia
+    gpus: all
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        PRELOAD_MODEL: ${PRELOAD_MODEL:-false}
+        MODEL_ID: ${HF_MODEL_ID:-Qwen/Qwen-Image-Layered}
+    container_name: image-layer-worker
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      HF_HOME: ${HF_HOME:-/root/.cache/huggingface}
+      HF_MODEL_ID: ${HF_MODEL_ID:-Qwen/Qwen-Image-Layered}
+      OUTPUT_DIR: ${OUTPUT_DIR:-/tmp/output}
+      OUTPUT_RETENTION_SECONDS: ${OUTPUT_RETENTION_SECONDS:-3600}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command: ["celery", "-A", "tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+    depends_on:
+      - redis
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+      - output_data:/tmp/output
+    runtime: nvidia
+    gpus: all
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: image-layer-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  frontend:
+    image: nginx:1.27-alpine
+    container_name: image-layer-frontend
+    ports:
+      - "80:80"
+    volumes:
+      - ./frontend:/usr/share/nginx/html:ro
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Keep this project and these volumes inside the WSL filesystem (for example /home/<user>/image-layer-saas).
+  # Avoid /mnt/c/... because cross-filesystem I/O is significantly slower.
+  hf_cache:
+  output_data:
+  redis_data:

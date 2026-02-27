@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LayerForge | Image Layer Decomposition</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="hero">
+        <p class="eyebrow">SaaS-style image tooling</p>
+        <h1>LayerForge</h1>
+        <p class="subtitle">Decompose any image into clean transparent PNG layers.</p>
+      </header>
+
+      <section class="workspace">
+        <article class="panel controls">
+          <input id="file-input" type="file" accept=".jpg,.jpeg,.png,.webp" hidden />
+          <button id="drop-zone" type="button" class="drop-zone" aria-label="Upload image">
+            <span class="drop-title">Drag and drop your image</span>
+            <span class="drop-subtitle">or click to browse (JPG, PNG, WEBP up to 20MB)</span>
+          </button>
+
+          <div class="slider-wrap">
+            <label for="layers">Layers</label>
+            <div class="slider-line">
+              <input id="layers" type="range" min="2" max="8" value="4" />
+              <span id="layers-value" class="chip">4</span>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button id="decompose-btn" class="btn btn-primary" disabled>Decompose Image</button>
+            <button id="reset-btn" class="btn btn-secondary" type="button">Reset / New Image</button>
+          </div>
+
+          <div id="progress-wrap" class="progress-wrap hidden">
+            <div class="progress-head">
+              <span id="progress-label">Processing...</span>
+              <span id="progress-percent">0%</span>
+            </div>
+            <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+          </div>
+
+          <p id="status" class="status" aria-live="polite"></p>
+          <p id="error" class="error hidden" aria-live="assertive"></p>
+        </article>
+
+        <article class="panel preview">
+          <h2>Preview</h2>
+          <div id="preview-shell" class="preview-shell empty">
+            <p id="preview-placeholder">No image selected yet.</p>
+            <img id="preview-image" alt="Upload preview" hidden />
+          </div>
+        </article>
+      </section>
+
+      <section id="results" class="results hidden">
+        <div class="results-head">
+          <h2>Extracted Layers</h2>
+          <a id="download-zip" class="btn btn-primary" download>Download All as ZIP</a>
+        </div>
+        <div id="gallery" class="gallery" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

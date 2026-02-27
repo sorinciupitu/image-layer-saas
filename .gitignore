@@ -1,0 +1,22 @@
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Hugging Face and model cache
+.cache/
+**/.cache/huggingface/
+huggingface/
+
+# Runtime outputs
+/tmp/output/
+backend/tmp/output/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

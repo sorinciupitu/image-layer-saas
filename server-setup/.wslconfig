@@ -1,0 +1,12 @@
+; Place this file on the Windows host at:
+; C:\Users\<username>\.wslconfig
+; Do not place it inside the Linux filesystem.
+; After changing this file, restart WSL with:
+;   wsl --shutdown
+;   wsl
+
+[wsl2]
+memory=40GB
+processors=16
+swap=8GB
+localhostForwarding=true

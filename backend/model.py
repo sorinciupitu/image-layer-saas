@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import bisect
+import inspect
+import logging
+import os
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import torch
+from PIL import Image
+
+LOGGER = logging.getLogger(__name__)
+
+DEFAULT_MODEL_ID = os.getenv("HF_MODEL_ID", "Qwen/Qwen-Image-Layered")
+
+
+@dataclass(frozen=True)
+class ModelRuntimeInfo:
+    model_id: str
+    device: str
+    dtype: str
+    loaded: bool
+
+
+class LayerDecompositionModel:
+    _instance: "LayerDecompositionModel | None" = None
+    _instance_lock = threading.Lock()
+
+    def __init__(self, model_id: str = DEFAULT_MODEL_ID) -> None:
+        self.model_id = model_id
+        self._pipeline: Any | None = None
+        self._load_lock = threading.Lock()
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._dtype = torch.float16 if self._device == "cuda" else torch.float32
+
+    @classmethod
+    def instance(cls, model_id: str = DEFAULT_MODEL_ID) -> "LayerDecompositionModel":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = cls(model_id=model_id)
+            return cls._instance
+
+    def is_loaded(self) -> bool:
+        return self._pipeline is not None
+
+    def runtime_info(self) -> ModelRuntimeInfo:
+        return ModelRuntimeInfo(
+            model_id=self.model_id,
+            device=self._device,
+            dtype=str(self._dtype).replace("torch.", ""),
+            loaded=self.is_loaded(),
+        )
+
+    def ensure_loaded(self) -> None:
+        if self._pipeline is not None:
+            return
+        with self._load_lock:
+            if self._pipeline is not None:
+                return
+            self._pipeline = self._load_pipeline()
+            LOGGER.info(
+                "Loaded decomposition model '%s' on %s with dtype=%s",
+                self.model_id,
+                self._device,
+                self._dtype,
+            )
+
+    def decompose_image(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
+        if not 2 <= num_layers <= 8:
+            raise ValueError("num_layers must be between 2 and 8")
+
+        rgba_image = image.convert("RGBA")
+        started_at = time.perf_counter()
+
+        try:
+            self.ensure_loaded()
+            layers = self._run_model_inference(rgba_image, num_layers)
+        except Exception as exc:
+            LOGGER.exception("Model inference failed; using deterministic fallback: %s", exc)
+            layers = self._fallback_decompose(rgba_image, num_layers)
+
+        elapsed = time.perf_counter() - started_at
+        LOGGER.info("Image decomposition completed in %.2fs (layers=%d)", elapsed, len(layers))
+        return layers
+
+    def _load_pipeline(self) -> Any:
+        from diffusers import DiffusionPipeline, QwenImageLayeredPipeline
+
+        load_kwargs: dict[str, Any] = {
+            "torch_dtype": self._dtype,
+            "low_cpu_mem_usage": True,
+        }
+
+        if self._device == "cuda":
+            load_kwargs["device_map"] = "auto"
+            load_kwargs["variant"] = "fp16"
+
+        try:
+            pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
+        except Exception:
+            load_kwargs.pop("variant", None)
+            pipeline = DiffusionPipeline.from_pretrained(self.model_id, **load_kwargs)
+
+        if self._device == "cuda":
+            pipeline.to("cuda")
+            if hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
+                try:
+                    pipeline.enable_xformers_memory_efficient_attention()
+                except Exception:
+                    LOGGER.debug("xFormers optimization not available for this pipeline")
+
+        return pipeline
+
+    def _run_model_inference(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
+        if self._pipeline is None:
+            raise RuntimeError("Model pipeline is not loaded")
+
+        kwargs = self._build_inference_kwargs(image=image, num_layers=num_layers)
+        output: Any
+        with torch.inference_mode():
+            if self._device == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    output = self._pipeline(**kwargs)
+            else:
+                output = self._pipeline(**kwargs)
+
+        extracted_layers = self._extract_layers(output)
+        normalized_layers = self._normalize_layers(extracted_layers, image.size, num_layers)
+        if not normalized_layers:
+            raise RuntimeError("Model returned no layers")
+        return normalized_layers
+
+    def _build_inference_kwargs(self, image: Image.Image, num_layers: int) -> dict[str, Any]:
+        if self._pipeline is None:
+            raise RuntimeError("Model pipeline is not loaded")
+
+        signature = inspect.signature(self._pipeline.__call__)
+        params = signature.parameters
+        kwargs: dict[str, Any] = {}
+
+        if "image" in params:
+            kwargs["image"] = image
+        elif "input_image" in params:
+            kwargs["input_image"] = image
+        elif "init_image" in params:
+            kwargs["init_image"] = image
+        else:
+            kwargs["image"] = image
+
+        if "layers" in params:
+            kwargs["layers"] = num_layers
+        elif "num_layers" in params:
+            kwargs["num_layers"] = num_layers
+        elif "n_layers" in params:
+            kwargs["n_layers"] = num_layers
+
+        if "output_type" in params:
+            kwargs["output_type"] = "pil"
+        if "return_dict" in params:
+            kwargs["return_dict"] = True
+        if "negative_prompt" in params:
+            kwargs["negative_prompt"] = " "
+        if "num_images_per_prompt" in params:
+            kwargs["num_images_per_prompt"] = 1
+        if "num_inference_steps" in params:
+            kwargs["num_inference_steps"] = 50
+        if "true_cfg_scale" in params:
+            kwargs["true_cfg_scale"] = 4.0
+        if "cfg_normalize" in params:
+            kwargs["cfg_normalize"] = True
+        if "use_en_prompt" in params:
+            kwargs["use_en_prompt"] = True
+        if "resolution" in params:
+            kwargs["resolution"] = 640
+
+        return kwargs
+
+    def _extract_layers(self, output: Any) -> list[Image.Image]:
+        candidates: list[Any] = []
+        self._collect_candidates(output, candidates)
+
+        layer_images: list[Image.Image] = []
+        for item in candidates:
+            if isinstance(item, Image.Image):
+                layer_images.append(item.convert("RGBA"))
+            elif isinstance(item, (list, tuple)):
+                for sub_item in item:
+                    if isinstance(sub_item, Image.Image):
+                        layer_images.append(sub_item.convert("RGBA"))
+        return layer_images
+
+    def _collect_candidates(self, value: Any, sink: list[Any]) -> None:
+        if value is None:
+            return
+        if isinstance(value, Image.Image):
+            sink.append(value)
+            return
+        if isinstance(value, dict):
+            for key in ("layers", "images", "output", "outputs", "result"):
+                if key in value:
+                    self._collect_candidates(value[key], sink)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                self._collect_candidates(item, sink)
+            return
+        for attr in ("layers", "images", "output", "outputs", "result"):
+            if hasattr(value, attr):
+                self._collect_candidates(getattr(value, attr), sink)
+
+    def _normalize_layers(
+        self,
+        layers: Sequence[Image.Image],
+        size: tuple[int, int],
+        expected_layers: int,
+    ) -> list[Image.Image]:
+        normalized: list[Image.Image] = [layer.convert("RGBA").resize(size) for layer in layers]
+        if len(normalized) >= expected_layers:
+            return normalized[:expected_layers]
+
+        while len(normalized) < expected_layers:
+            normalized.append(Image.new("RGBA", size, (0, 0, 0, 0)))
+        return normalized
+
+    def _fallback_decompose(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
+        width, height = image.size
+        alpha_channel = image.split()[-1]
+        opaque_values = [px for px in alpha_channel.getdata() if px > 0]
+        if not opaque_values:
+            return [Image.new("RGBA", image.size, (0, 0, 0, 0)) for _ in range(num_layers)]
+
+        thresholds = self._build_luma_thresholds(image=image, num_layers=num_layers)
+        masks = [Image.new("L", image.size, 0) for _ in range(num_layers)]
+        mask_access = [mask.load() for mask in masks]
+        rgba_pixels = image.load()
+
+        for y in range(height):
+            for x in range(width):
+                r, g, b, a = rgba_pixels[x, y]
+                if a == 0:
+                    continue
+                luma = int(0.299 * r + 0.587 * g + 0.114 * b)
+                layer_index = bisect.bisect_right(thresholds, luma)
+                mask_access[layer_index][x, y] = a
+
+        layers: list[Image.Image] = []
+        for mask in masks:
+            layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+            layer.paste(image, (0, 0), mask)
+            layers.append(layer)
+        return layers
+
+    def _build_luma_thresholds(self, image: Image.Image, num_layers: int) -> list[int]:
+        luma_values: list[int] = []
+        for r, g, b, a in image.getdata():
+            if a > 0:
+                luma_values.append(int(0.299 * r + 0.587 * g + 0.114 * b))
+
+        if not luma_values:
+            return [0] * max(num_layers - 1, 1)
+
+        luma_values.sort()
+        thresholds: list[int] = []
+        for i in range(1, num_layers):
+            idx = int((i / num_layers) * (len(luma_values) - 1))
+            thresholds.append(luma_values[idx])
+        return thresholds
+
+
+def decompose_image(image: Image.Image, num_layers: int) -> list[Image.Image]:
+    return LayerDecompositionModel.instance().decompose_image(image=image, num_layers=num_layers)
+
+
+def runtime_info() -> ModelRuntimeInfo:
+    return LayerDecompositionModel.instance().runtime_info()
