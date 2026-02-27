@@ -330,7 +330,12 @@ async function safeJson(response) {
   try {
     return await response.json();
   } catch (_error) {
-    return {};
+    try {
+      const text = await response.text();
+      return { detail: text || "Unexpected non-JSON server response" };
+    } catch (_innerError) {
+      return {};
+    }
   }
 }
 

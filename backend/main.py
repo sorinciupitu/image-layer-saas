@@ -97,11 +97,18 @@ async def decompose(
 
     _validate_uploaded_image(file_bytes=file_bytes)
 
-    task = async_decompose.delay(
-        image_b64=base64.b64encode(file_bytes).decode("utf-8"),
-        original_filename=image.filename or "upload.png",
-        num_layers=num_layers,
-    )
+    try:
+        task = async_decompose.delay(
+            image_b64=base64.b64encode(file_bytes).decode("utf-8"),
+            original_filename=image.filename or "upload.png",
+            num_layers=num_layers,
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to enqueue decomposition task: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Task queue unavailable. Verify Redis/Celery services. Error: {exc}",
+        ) from exc
     task_id = task.id
 
     force_async = request.headers.get("X-Async-Only", "").strip().lower() in {"1", "true", "yes"}
