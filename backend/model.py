@@ -97,12 +97,14 @@ class LayerDecompositionModel:
         return layers
 
     def _load_pipeline(self) -> Any:
+        self._apply_torch_custom_op_compatibility_shim()
         try:
             from diffusers import QwenImageLayeredPipeline
         except Exception as exc:
             raise RuntimeError(
                 "QwenImageLayeredPipeline is unavailable. Install latest diffusers from GitHub "
-                "or a compatible release with Qwen-Image-Layered support."
+                "or a compatible release with Qwen-Image-Layered support. "
+                "If using torch 2.4.x, enable the custom-op compatibility shim."
             ) from exc
 
         load_kwargs: dict[str, Any] = {
@@ -129,6 +131,63 @@ class LayerDecompositionModel:
                     LOGGER.debug("xFormers optimization not available for this pipeline")
 
         return pipeline
+
+    def _apply_torch_custom_op_compatibility_shim(self) -> None:
+        """
+        Diffusers `main` can register torch custom ops during import.
+        On torch 2.4.x this may fail with `infer_schema(... unsupported type torch.Tensor)`.
+        For this runtime we monkey-patch custom-op decorators to no-op wrappers.
+        """
+        version = getattr(torch, "__version__", "")
+        if not version.startswith("2.4"):
+            return
+
+        if os.getenv("DIFFUSERS_DISABLE_CUSTOM_OP_SHIM", "false").lower() in {"1", "true", "yes"}:
+            return
+
+        if not hasattr(torch, "library"):
+            return
+
+        try:
+            current_custom_op = getattr(torch.library, "custom_op")
+            if getattr(current_custom_op, "__name__", "") == "_diffusers_noop_custom_op":
+                return
+        except Exception:
+            return
+
+        def _diffusers_noop_custom_op(
+            name: str,
+            fn: Any | None = None,
+            /,
+            *,
+            mutates_args: Any = (),
+            device_types: Any = None,
+            schema: str | None = None,
+        ) -> Any:
+            def _decorator(func: Any) -> Any:
+                return func
+
+            return _decorator if fn is None else fn
+
+        def _diffusers_noop_register_fake(
+            op: Any,
+            fn: Any | None = None,
+            /,
+            *,
+            lib: Any = None,
+            _stacklevel: int = 1,
+        ) -> Any:
+            def _decorator(func: Any) -> Any:
+                return func
+
+            return _decorator if fn is None else fn
+
+        torch.library.custom_op = _diffusers_noop_custom_op  # type: ignore[assignment]
+        torch.library.register_fake = _diffusers_noop_register_fake  # type: ignore[assignment]
+        LOGGER.warning(
+            "Applied torch 2.4 custom-op compatibility shim for diffusers import "
+            "(set DIFFUSERS_DISABLE_CUSTOM_OP_SHIM=true to disable)."
+        )
 
     def _run_model_inference(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
         if self._pipeline is None:
