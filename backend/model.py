@@ -113,8 +113,10 @@ class LayerDecompositionModel:
         }
 
         if self._device == "cuda":
-            load_kwargs["device_map"] = "auto"
+            load_kwargs["device_map"] = "cuda"
             load_kwargs["variant"] = "fp16"
+        else:
+            load_kwargs["device_map"] = "cpu"
 
         try:
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
@@ -122,7 +124,7 @@ class LayerDecompositionModel:
             load_kwargs.pop("variant", None)
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
 
-        if self._device == "cuda":
+        if self._device == "cuda" and not load_kwargs.get("device_map"):
             pipeline.to("cuda")
             if hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
                 try:
