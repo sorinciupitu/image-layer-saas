@@ -1,5 +1,6 @@
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
 
 const fileInput = document.getElementById("file-input");
 const dropZone = document.getElementById("drop-zone");
@@ -176,7 +177,7 @@ async function startDecomposition() {
 
 async function pollTask(taskId) {
   const startedAt = Date.now();
-  const timeoutMs = 120000;
+  const timeoutMs = PROCESSING_TIMEOUT_MS;
 
   while (Date.now() - startedAt < timeoutMs) {
     const response = await fetch(`/api/status/${taskId}`, { method: "GET" });
@@ -204,7 +205,9 @@ async function pollTask(taskId) {
     await sleep(1500);
   }
 
-  throw new Error("Processing timed out after 120 seconds.");
+  throw new Error(
+    "Processing is still running (first model download can take several minutes). Please retry in a moment."
+  );
 }
 
 function renderResults(payload) {
