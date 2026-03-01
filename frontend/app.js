@@ -5,6 +5,7 @@ const POLL_INTERVAL_MS = 1500;
 const STALL_NO_ACTIVITY_MS = 5 * 60 * 1000;
 const STATUS_FETCH_MAX_DOWNTIME_MS = 3 * 60 * 1000;
 const NO_EVENT_HEARTBEAT_MS = 30 * 1000;
+const APP_BUILD = "20260301c";
 
 const PRESETS = {
   safe: { resolution: 384, steps: 16, cfg: 2.5 },
@@ -62,7 +63,7 @@ function initialize() {
   if (runtimeConsole) {
     runtimeConsole.textContent = "";
   }
-  appendConsole("Frontend script loaded.");
+  appendConsole(`Frontend script loaded (build ${APP_BUILD}).`);
 
   const required = [
     ["fileInput", fileInput],
