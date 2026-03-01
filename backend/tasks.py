@@ -91,23 +91,42 @@ def _create_zip(task_dir: Path, layer_paths: list[Path]) -> Path:
 
 
 @celery_app.task(bind=True, name="async_decompose")
-def async_decompose(self: Any, image_b64: str, original_filename: str, num_layers: int) -> dict[str, Any]:
+def async_decompose(
+    self: Any,
+    image_b64: str,
+    original_filename: str,
+    num_layers: int,
+    inference_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     task_id = str(self.request.id)
     task_dir = get_task_dir(task_id)
     task_dir.mkdir(parents=True, exist_ok=True)
+    options = inference_options or {}
+    events: list[str] = []
+
+    def update_progress(progress: int, message: str) -> None:
+        events.append(message)
+        self.update_state(
+            state="PROGRESS",
+            meta={
+                "progress": progress,
+                "message": message,
+                "events": events[-20:],
+            },
+        )
 
     try:
-        self.update_state(state="PROGRESS", meta={"progress": 10, "message": "Decoding image"})
+        update_progress(10, "Decoding image")
         image = _decode_image(image_b64=image_b64)
 
-        self.update_state(state="PROGRESS", meta={"progress": 45, "message": "Running model inference"})
-        layers = decompose_image(image=image, num_layers=num_layers)
+        update_progress(25, "Preparing inference")
+        layers = decompose_image(image=image, num_layers=num_layers, options=options)
 
-        self.update_state(state="PROGRESS", meta={"progress": 75, "message": "Saving layer files"})
+        update_progress(80, "Saving layer files")
         layer_paths = _save_layers(task_dir=task_dir, layers=layers)
         zip_path = _create_zip(task_dir=task_dir, layer_paths=layer_paths)
 
-        self.update_state(state="PROGRESS", meta={"progress": 95, "message": "Finalizing output"})
+        update_progress(95, "Finalizing output")
         schedule_cleanup(task_dir=task_dir)
     except Exception as exc:
         cleanup_task_dir(task_dir)
@@ -121,4 +140,5 @@ def async_decompose(self: Any, image_b64: str, original_filename: str, num_layer
         "zip_path": str(zip_path),
         "zip_name": download_name,
         "layers": [layer_path.name for layer_path in layer_paths],
+        "events": events[-20:],
     }

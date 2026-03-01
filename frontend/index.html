@@ -30,6 +30,51 @@
             </div>
           </div>
 
+          <div class="advanced">
+            <div class="advanced-head">
+              <h3>Tuning Options</h3>
+              <label class="inline-option">
+                <input id="toggle-advanced" type="checkbox" />
+                <span>Custom</span>
+              </label>
+            </div>
+
+            <div class="field-grid">
+              <label class="field">
+                <span>Preset</span>
+                <select id="inference-preset">
+                  <option value="safe">Safe (low memory)</option>
+                  <option value="balanced" selected>Balanced</option>
+                  <option value="quality">Quality</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </label>
+
+              <label class="field">
+                <span>Resolution</span>
+                <input id="resolution" type="number" min="256" max="1024" step="64" value="512" disabled />
+              </label>
+
+              <label class="field">
+                <span>Inference Steps</span>
+                <input
+                  id="inference-steps"
+                  type="number"
+                  min="8"
+                  max="80"
+                  step="1"
+                  value="24"
+                  disabled
+                />
+              </label>
+
+              <label class="field">
+                <span>CFG Scale</span>
+                <input id="cfg-scale" type="number" min="1" max="8" step="0.1" value="3.0" disabled />
+              </label>
+            </div>
+          </div>
+
           <div class="actions">
             <button id="decompose-btn" class="btn btn-primary" disabled>Decompose Image</button>
             <button id="reset-btn" class="btn btn-secondary" type="button">Reset / New Image</button>
@@ -47,6 +92,14 @@
 
           <p id="status" class="status" aria-live="polite"></p>
           <p id="error" class="error hidden" aria-live="assertive"></p>
+
+          <div class="console-wrap">
+            <div class="console-head">
+              <h3>Runtime Console</h3>
+              <button id="clear-console" class="btn btn-secondary" type="button">Clear</button>
+            </div>
+            <pre id="runtime-console" class="runtime-console">Waiting for task...</pre>
+          </div>
         </article>
 
         <article class="panel preview">

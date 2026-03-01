@@ -21,6 +21,9 @@ ENABLE_HEURISTIC_FALLBACK = os.getenv("ENABLE_HEURISTIC_FALLBACK", "false").lowe
     "yes",
 }
 LOW_VRAM_THRESHOLD_GB = float(os.getenv("LOW_VRAM_THRESHOLD_GB", "20"))
+DEFAULT_INFERENCE_STEPS = int(os.getenv("DEFAULT_INFERENCE_STEPS", "24"))
+DEFAULT_RESOLUTION = int(os.getenv("DEFAULT_RESOLUTION", "512"))
+DEFAULT_CFG_SCALE = float(os.getenv("DEFAULT_CFG_SCALE", "3.0"))
 
 
 @dataclass(frozen=True)
@@ -29,6 +32,37 @@ class ModelRuntimeInfo:
     device: str
     dtype: str
     loaded: bool
+
+
+@dataclass(frozen=True)
+class InferenceOptions:
+    num_inference_steps: int
+    resolution: int
+    true_cfg_scale: float
+    use_en_prompt: bool
+    cfg_normalize: bool
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any] | None) -> "InferenceOptions":
+        data = raw or {}
+        steps = _coerce_int(data.get("num_inference_steps"), DEFAULT_INFERENCE_STEPS)
+        resolution = _coerce_int(data.get("resolution"), DEFAULT_RESOLUTION)
+        cfg = _coerce_float(data.get("true_cfg_scale"), DEFAULT_CFG_SCALE)
+        use_en_prompt = _coerce_bool(data.get("use_en_prompt"), True)
+        cfg_normalize = _coerce_bool(data.get("cfg_normalize"), True)
+
+        steps = max(8, min(80, steps))
+        resolution = max(256, min(1024, resolution))
+        resolution = int(round(resolution / 64) * 64)
+        cfg = max(1.0, min(8.0, cfg))
+
+        return cls(
+            num_inference_steps=steps,
+            resolution=resolution,
+            true_cfg_scale=cfg,
+            use_en_prompt=use_en_prompt,
+            cfg_normalize=cfg_normalize,
+        )
 
 
 class LayerDecompositionModel:
@@ -77,16 +111,26 @@ class LayerDecompositionModel:
                 self._dtype,
             )
 
-    def decompose_image(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
+    def decompose_image(
+        self,
+        image: Image.Image,
+        num_layers: int,
+        options: dict[str, Any] | None = None,
+    ) -> list[Image.Image]:
         if not 2 <= num_layers <= 8:
             raise ValueError("num_layers must be between 2 and 8")
 
         rgba_image = image.convert("RGBA")
+        inference_options = InferenceOptions.from_raw(options)
         started_at = time.perf_counter()
 
         try:
             self.ensure_loaded()
-            layers = self._run_model_inference(rgba_image, num_layers)
+            layers = self._run_model_inference(
+                image=rgba_image,
+                num_layers=num_layers,
+                options=inference_options,
+            )
         except Exception as exc:
             if self._allow_fallback:
                 LOGGER.exception("Model inference failed; using deterministic fallback: %s", exc)
@@ -221,11 +265,16 @@ class LayerDecompositionModel:
             "(set DIFFUSERS_DISABLE_CUSTOM_OP_SHIM=true to disable)."
         )
 
-    def _run_model_inference(self, image: Image.Image, num_layers: int) -> list[Image.Image]:
+    def _run_model_inference(
+        self,
+        image: Image.Image,
+        num_layers: int,
+        options: InferenceOptions,
+    ) -> list[Image.Image]:
         if self._pipeline is None:
             raise RuntimeError("Model pipeline is not loaded")
 
-        kwargs = self._build_inference_kwargs(image=image, num_layers=num_layers)
+        kwargs = self._build_inference_kwargs(image=image, num_layers=num_layers, options=options)
         output: Any
         with torch.inference_mode():
             if self._device == "cuda":
@@ -240,7 +289,12 @@ class LayerDecompositionModel:
             raise RuntimeError("Model returned no layers")
         return normalized_layers
 
-    def _build_inference_kwargs(self, image: Image.Image, num_layers: int) -> dict[str, Any]:
+    def _build_inference_kwargs(
+        self,
+        image: Image.Image,
+        num_layers: int,
+        options: InferenceOptions,
+    ) -> dict[str, Any]:
         if self._pipeline is None:
             raise RuntimeError("Model pipeline is not loaded")
 
@@ -273,15 +327,15 @@ class LayerDecompositionModel:
         if "num_images_per_prompt" in params:
             kwargs["num_images_per_prompt"] = 1
         if "num_inference_steps" in params:
-            kwargs["num_inference_steps"] = 50
+            kwargs["num_inference_steps"] = options.num_inference_steps
         if "true_cfg_scale" in params:
-            kwargs["true_cfg_scale"] = 4.0
+            kwargs["true_cfg_scale"] = options.true_cfg_scale
         if "cfg_normalize" in params:
-            kwargs["cfg_normalize"] = True
+            kwargs["cfg_normalize"] = options.cfg_normalize
         if "use_en_prompt" in params:
-            kwargs["use_en_prompt"] = True
+            kwargs["use_en_prompt"] = options.use_en_prompt
         if "resolution" in params:
-            kwargs["resolution"] = 640
+            kwargs["resolution"] = options.resolution
 
         return kwargs
 
@@ -445,9 +499,43 @@ class LayerDecompositionModel:
         return thresholds
 
 
-def decompose_image(image: Image.Image, num_layers: int) -> list[Image.Image]:
-    return LayerDecompositionModel.instance().decompose_image(image=image, num_layers=num_layers)
+def decompose_image(
+    image: Image.Image,
+    num_layers: int,
+    options: dict[str, Any] | None = None,
+) -> list[Image.Image]:
+    return LayerDecompositionModel.instance().decompose_image(
+        image=image,
+        num_layers=num_layers,
+        options=options,
+    )
 
 
 def runtime_info() -> ModelRuntimeInfo:
     return LayerDecompositionModel.instance().runtime_info()
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    return default

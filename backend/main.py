@@ -84,9 +84,23 @@ async def decompose(
     request: Request,
     image: UploadFile = File(...),
     num_layers: int = Form(default=4),
+    inference_preset: str = Form(default="balanced"),
+    resolution: int = Form(default=512),
+    num_inference_steps: int = Form(default=24),
+    true_cfg_scale: float = Form(default=3.0),
+    use_en_prompt: bool = Form(default=True),
+    cfg_normalize: bool = Form(default=True),
 ) -> Response:
     _validate_num_layers(num_layers=num_layers)
     _validate_upload_metadata(upload=image)
+    inference_options = _build_inference_options(
+        inference_preset=inference_preset,
+        resolution=resolution,
+        num_inference_steps=num_inference_steps,
+        true_cfg_scale=true_cfg_scale,
+        use_en_prompt=use_en_prompt,
+        cfg_normalize=cfg_normalize,
+    )
 
     file_bytes = await image.read(MAX_FILE_SIZE_BYTES + 1)
     if len(file_bytes) > MAX_FILE_SIZE_BYTES:
@@ -102,6 +116,7 @@ async def decompose(
             image_b64=base64.b64encode(file_bytes).decode("utf-8"),
             original_filename=image.filename or "upload.png",
             num_layers=num_layers,
+            inference_options=inference_options,
         )
     except Exception as exc:
         LOGGER.exception("Failed to enqueue decomposition task: %s", exc)
@@ -161,6 +176,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
     zip_path = get_zip_path(task_id)
     progress = _extract_progress(result)
     state_message = _extract_state_message(result)
+    events = _extract_events(result)
 
     if result.successful() or zip_path.exists():
         payload = _safe_result_payload(result.result) if result.successful() else {}
@@ -173,6 +189,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
             "download_url": str(request.url_for("download_result", task_id=task_id)),
             "layers": layers,
             "layer_urls": layer_urls,
+            "events": payload.get("events", events),
         }
 
     if result.failed():
@@ -182,6 +199,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
             "progress": progress,
             "message": state_message,
             "error": _extract_task_error(result),
+            "events": events,
         }
 
     mapped_status: Literal["pending", "processing"] = (
@@ -192,6 +210,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
         "status": mapped_status,
         "progress": progress,
         "message": state_message,
+        "events": events,
     }
 
 
@@ -288,6 +307,14 @@ def _extract_state_message(result: AsyncResult) -> str | None:
     return str(message) if message else None
 
 
+def _extract_events(result: AsyncResult) -> list[str]:
+    meta = result.info if isinstance(result.info, dict) else {}
+    raw_events = meta.get("events", [])
+    if not isinstance(raw_events, list):
+        return []
+    return [str(item) for item in raw_events][-20:]
+
+
 def _discover_layer_files(task_id: str) -> list[str]:
     task_dir = get_task_dir(task_id)
     if not task_dir.exists():
@@ -299,6 +326,44 @@ def _discover_layer_files(task_id: str) -> list[str]:
 
 def _build_layer_urls(request: Request, task_id: str, layers: list[str]) -> list[str]:
     return [str(request.url_for("download_layer", task_id=task_id, layer_name=layer)) for layer in layers]
+
+
+def _build_inference_options(
+    inference_preset: str,
+    resolution: int,
+    num_inference_steps: int,
+    true_cfg_scale: float,
+    use_en_prompt: bool,
+    cfg_normalize: bool,
+) -> dict[str, Any]:
+    preset = inference_preset.strip().lower()
+    preset_map: dict[str, dict[str, Any]] = {
+        "safe": {"resolution": 384, "num_inference_steps": 16, "true_cfg_scale": 2.5},
+        "balanced": {"resolution": 512, "num_inference_steps": 24, "true_cfg_scale": 3.0},
+        "quality": {"resolution": 640, "num_inference_steps": 32, "true_cfg_scale": 3.5},
+        "custom": {},
+    }
+    if preset not in preset_map:
+        raise HTTPException(status_code=422, detail="inference_preset must be one of: safe, balanced, quality, custom")
+
+    options: dict[str, Any] = {
+        "use_en_prompt": use_en_prompt,
+        "cfg_normalize": cfg_normalize,
+    }
+    options.update(preset_map[preset])
+    if preset == "custom":
+        options["resolution"] = resolution
+        options["num_inference_steps"] = num_inference_steps
+        options["true_cfg_scale"] = true_cfg_scale
+
+    try:
+        options["resolution"] = int(options.get("resolution", 512))
+        options["num_inference_steps"] = int(options.get("num_inference_steps", 24))
+        options["true_cfg_scale"] = float(options.get("true_cfg_scale", 3.0))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid inference tuning values") from exc
+
+    return options
 
 
 def _get_gpu_info() -> dict[str, Any]:

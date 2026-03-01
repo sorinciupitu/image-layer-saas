@@ -1,11 +1,24 @@
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
+const POLL_INTERVAL_MS = 1500;
+const STATUS_FETCH_RETRY_LIMIT = 20;
+
+const PRESETS = {
+  safe: { resolution: 384, steps: 16, cfg: 2.5 },
+  balanced: { resolution: 512, steps: 24, cfg: 3.0 },
+  quality: { resolution: 640, steps: 32, cfg: 3.5 },
+};
 
 const fileInput = document.getElementById("file-input");
 const dropZone = document.getElementById("drop-zone");
 const layersInput = document.getElementById("layers");
 const layersValue = document.getElementById("layers-value");
+const presetInput = document.getElementById("inference-preset");
+const toggleAdvanced = document.getElementById("toggle-advanced");
+const resolutionInput = document.getElementById("resolution");
+const stepsInput = document.getElementById("inference-steps");
+const cfgInput = document.getElementById("cfg-scale");
 const decomposeBtn = document.getElementById("decompose-btn");
 const resetBtn = document.getElementById("reset-btn");
 const progressWrap = document.getElementById("progress-wrap");
@@ -20,18 +33,23 @@ const previewPlaceholder = document.getElementById("preview-placeholder");
 const resultsSection = document.getElementById("results");
 const gallery = document.getElementById("gallery");
 const downloadZip = document.getElementById("download-zip");
+const runtimeConsole = document.getElementById("runtime-console");
+const clearConsoleBtn = document.getElementById("clear-console");
 
 let selectedFile = null;
 let previewUrl = null;
 let activeTaskId = null;
 let isProcessing = false;
+let seenEvents = new Set();
 
 initialize();
 
 function initialize() {
   layersValue.textContent = layersInput.value;
+  applyPresetValues(presetInput.value);
   bindUploadEvents();
   bindActionEvents();
+  appendConsole("Console ready.");
 }
 
 function bindUploadEvents() {
@@ -41,10 +59,9 @@ function bindUploadEvents() {
   });
 
   dropZone.addEventListener("click", () => {
-    if (isProcessing) {
-      return;
+    if (!isProcessing) {
+      fileInput.click();
     }
-    fileInput.click();
   });
 
   ["dragenter", "dragover"].forEach((eventName) => {
@@ -79,6 +96,30 @@ function bindActionEvents() {
     layersValue.textContent = layersInput.value;
   });
 
+  presetInput.addEventListener("change", () => {
+    const preset = presetInput.value;
+    toggleAdvanced.checked = preset === "custom";
+    setAdvancedEnabled(toggleAdvanced.checked);
+    if (preset !== "custom") {
+      applyPresetValues(preset);
+    }
+    appendConsole(`Preset selected: ${preset}.`);
+  });
+
+  toggleAdvanced.addEventListener("change", () => {
+    setAdvancedEnabled(toggleAdvanced.checked);
+    presetInput.value = toggleAdvanced.checked ? "custom" : "balanced";
+    if (!toggleAdvanced.checked) {
+      applyPresetValues("balanced");
+    }
+    appendConsole(`Custom tuning ${toggleAdvanced.checked ? "enabled" : "disabled"}.`);
+  });
+
+  clearConsoleBtn.addEventListener("click", () => {
+    runtimeConsole.textContent = "";
+    appendConsole("Console cleared.");
+  });
+
   resetBtn.addEventListener("click", () => resetState());
 
   decomposeBtn.addEventListener("click", async () => {
@@ -87,6 +128,19 @@ function bindActionEvents() {
     }
     await startDecomposition();
   });
+}
+
+function setAdvancedEnabled(enabled) {
+  resolutionInput.disabled = !enabled;
+  stepsInput.disabled = !enabled;
+  cfgInput.disabled = !enabled;
+}
+
+function applyPresetValues(presetName) {
+  const preset = PRESETS[presetName] || PRESETS.balanced;
+  resolutionInput.value = String(preset.resolution);
+  stepsInput.value = String(preset.steps);
+  cfgInput.value = String(preset.cfg);
 }
 
 function handleSelectedFile(file) {
@@ -111,6 +165,7 @@ function handleSelectedFile(file) {
   selectedFile = file;
   decomposeBtn.disabled = false;
   setStatus(`Selected: ${file.name}`);
+  appendConsole(`File selected: ${file.name} (${Math.round(file.size / 1024)} KB).`);
   renderPreview(file);
   clearResults();
 }
@@ -118,7 +173,6 @@ function handleSelectedFile(file) {
 function renderPreview(file) {
   if (previewUrl) {
     URL.revokeObjectURL(previewUrl);
-    previewUrl = null;
   }
 
   previewUrl = URL.createObjectURL(file);
@@ -128,6 +182,19 @@ function renderPreview(file) {
   previewShell.classList.remove("empty");
 }
 
+function collectInferenceOptions() {
+  const preset = presetInput.value;
+  const options = {
+    inference_preset: preset,
+    resolution: resolutionInput.value,
+    num_inference_steps: stepsInput.value,
+    true_cfg_scale: cfgInput.value,
+    use_en_prompt: "true",
+    cfg_normalize: "true",
+  };
+  return options;
+}
+
 async function startDecomposition() {
   if (!selectedFile) {
     return;
@@ -135,21 +202,27 @@ async function startDecomposition() {
 
   isProcessing = true;
   activeTaskId = null;
+  seenEvents = new Set();
   decomposeBtn.disabled = true;
   clearError();
   clearResults();
   showProgress(5, "Uploading image...");
+  appendConsole("Upload started.");
 
   const formData = new FormData();
   formData.append("image", selectedFile);
   formData.append("num_layers", String(layersInput.value));
 
+  const options = collectInferenceOptions();
+  Object.entries(options).forEach(([key, value]) => formData.append(key, String(value)));
+  appendConsole(
+    `Inference config: preset=${options.inference_preset}, resolution=${options.resolution}, steps=${options.num_inference_steps}, cfg=${options.true_cfg_scale}.`
+  );
+
   try {
     const response = await fetch("/api/decompose", {
       method: "POST",
-      headers: {
-        "X-Async-Only": "true",
-      },
+      headers: { "X-Async-Only": "true" },
       body: formData,
     });
 
@@ -164,10 +237,12 @@ async function startDecomposition() {
     }
 
     activeTaskId = payload.task_id;
+    appendConsole(`Task created: ${activeTaskId}`);
     await pollTask(activeTaskId);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unexpected error";
     setError(message);
+    appendConsole(`ERROR: ${message}`);
     hideProgress();
   } finally {
     isProcessing = false;
@@ -177,37 +252,65 @@ async function startDecomposition() {
 
 async function pollTask(taskId) {
   const startedAt = Date.now();
-  const timeoutMs = PROCESSING_TIMEOUT_MS;
+  let consecutiveStatusFailures = 0;
 
-  while (Date.now() - startedAt < timeoutMs) {
-    const response = await fetch(`/api/status/${taskId}`, { method: "GET" });
-    if (!response.ok) {
+  while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
+    try {
+      const response = await fetch(`/api/status/${taskId}`, { method: "GET" });
+      if (!response.ok) {
+        const payload = await safeJson(response);
+        throw new Error(payload.detail || `Status request failed (${response.status})`);
+      }
+
       const payload = await safeJson(response);
-      throw new Error(payload.detail || "Failed to fetch task status");
+      consecutiveStatusFailures = 0;
+
+      const progress = typeof payload.progress === "number" ? payload.progress : 0;
+      const message = payload.message || `Task ${taskId} is ${payload.status}`;
+      showProgress(progress, message);
+      appendEvents(payload.events);
+      appendConsole(`Status=${payload.status} progress=${progress}% ${message}`);
+
+      if (payload.status === "done") {
+        showProgress(100, "Decomposition complete.");
+        renderResults(payload);
+        setStatus("Layers are ready. Preview and download below.");
+        appendConsole("Task completed successfully.");
+        return;
+      }
+
+      if (payload.status === "error") {
+        throw new Error(payload.error || "Task failed");
+      }
+    } catch (error) {
+      consecutiveStatusFailures += 1;
+      const message = error instanceof Error ? error.message : "Unknown status error";
+      appendConsole(`Status fetch issue (${consecutiveStatusFailures}/${STATUS_FETCH_RETRY_LIMIT}): ${message}`);
+      if (consecutiveStatusFailures >= STATUS_FETCH_RETRY_LIMIT) {
+        throw new Error(`Failed to fetch task status repeatedly. Last error: ${message}`);
+      }
     }
 
-    const payload = await safeJson(response);
-    const progress = typeof payload.progress === "number" ? payload.progress : 0;
-    const message = payload.message || `Task ${taskId} is ${payload.status}`;
-    showProgress(progress, message);
-
-    if (payload.status === "done") {
-      showProgress(100, "Decomposition complete.");
-      renderResults(payload);
-      setStatus("Layers are ready. Preview and download below.");
-      return;
-    }
-
-    if (payload.status === "error") {
-      throw new Error(payload.error || "Task failed");
-    }
-
-    await sleep(1500);
+    await sleep(POLL_INTERVAL_MS);
   }
 
   throw new Error(
     "Processing is still running (first model download can take several minutes). Please retry in a moment."
   );
+}
+
+function appendEvents(events) {
+  if (!Array.isArray(events)) {
+    return;
+  }
+  events.forEach((eventMessage) => {
+    const line = String(eventMessage || "").trim();
+    if (!line || seenEvents.has(line)) {
+      return;
+    }
+    seenEvents.add(line);
+    appendConsole(`Worker: ${line}`);
+  });
 }
 
 function renderResults(payload) {
@@ -308,16 +411,23 @@ function resetState() {
   selectedFile = null;
   activeTaskId = null;
   isProcessing = false;
+  seenEvents = new Set();
 
   fileInput.value = "";
   decomposeBtn.disabled = true;
   layersInput.value = "4";
   layersValue.textContent = "4";
+  presetInput.value = "balanced";
+  toggleAdvanced.checked = false;
+  setAdvancedEnabled(false);
+  applyPresetValues("balanced");
 
   clearError();
   setStatus("Ready for a new image.");
   hideProgress();
   clearResults();
+  runtimeConsole.textContent = "";
+  appendConsole("Reset complete.");
 
   if (previewUrl) {
     URL.revokeObjectURL(previewUrl);
@@ -327,6 +437,12 @@ function resetState() {
   previewImage.hidden = true;
   previewPlaceholder.hidden = false;
   previewShell.classList.add("empty");
+}
+
+function appendConsole(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  runtimeConsole.textContent += `[${timestamp}] ${message}\n`;
+  runtimeConsole.scrollTop = runtimeConsole.scrollHeight;
 }
 
 async function safeJson(response) {
