@@ -20,6 +20,7 @@ ENABLE_HEURISTIC_FALLBACK = os.getenv("ENABLE_HEURISTIC_FALLBACK", "false").lowe
     "true",
     "yes",
 }
+LOW_VRAM_THRESHOLD_GB = float(os.getenv("LOW_VRAM_THRESHOLD_GB", "20"))
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,8 @@ class LayerDecompositionModel:
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._dtype = torch.float16 if self._device == "cuda" else torch.float32
         self._allow_fallback = ENABLE_HEURISTIC_FALLBACK
+        self._cuda_vram_gb = self._detect_cuda_vram_gb()
+        self._low_vram_mode = self._device == "cuda" and self._cuda_vram_gb < LOW_VRAM_THRESHOLD_GB
 
     @classmethod
     def instance(cls, model_id: str = DEFAULT_MODEL_ID) -> "LayerDecompositionModel":
@@ -113,7 +116,7 @@ class LayerDecompositionModel:
         }
 
         if self._device == "cuda":
-            load_kwargs["device_map"] = "cuda"
+            load_kwargs["device_map"] = "balanced" if self._low_vram_mode else "cuda"
             load_kwargs["variant"] = "fp16"
         else:
             load_kwargs["device_map"] = "cpu"
@@ -139,7 +142,27 @@ class LayerDecompositionModel:
                 except Exception:
                     LOGGER.debug("xFormers optimization not available for this pipeline")
 
+        if self._low_vram_mode and hasattr(pipeline, "enable_model_cpu_offload"):
+            try:
+                pipeline.enable_model_cpu_offload()
+                LOGGER.warning(
+                    "Enabled low-VRAM mode with CPU offload (GPU VRAM %.2f GB < %.2f GB threshold).",
+                    self._cuda_vram_gb,
+                    LOW_VRAM_THRESHOLD_GB,
+                )
+            except Exception as exc:
+                LOGGER.warning("Failed to enable model CPU offload: %s", exc)
+
         return pipeline
+
+    def _detect_cuda_vram_gb(self) -> float:
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            total_bytes = float(torch.cuda.get_device_properties(0).total_memory)
+            return total_bytes / (1024**3)
+        except Exception:
+            return 0.0
 
     def _apply_torch_custom_op_compatibility_shim(self) -> None:
         """

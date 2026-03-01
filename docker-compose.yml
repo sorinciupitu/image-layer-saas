@@ -58,7 +58,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
-    command: ["celery", "-A", "tasks.celery_app", "worker", "--loglevel=INFO", "--concurrency=1"]
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:128}
+    command: ["celery", "-A", "tasks.celery_app", "worker", "--pool=solo", "--loglevel=INFO", "--concurrency=1"]
     depends_on:
       - redis
     volumes:
