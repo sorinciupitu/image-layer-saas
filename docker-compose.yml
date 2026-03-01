@@ -21,6 +21,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
     volumes:
       - hf_cache:/root/.cache/huggingface
       - output_data:/tmp/output

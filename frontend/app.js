@@ -48,7 +48,8 @@ initialize();
 
 function initialize() {
   layersValue.textContent = layersInput.value;
-  applyPresetValues(presetInput.value);
+  presetInput.value = "safe";
+  applyPresetValues("safe");
   bindUploadEvents();
   bindActionEvents();
   appendConsole("Console ready.");
@@ -450,11 +451,11 @@ function resetState() {
   decomposeBtn.disabled = true;
   layersInput.value = "4";
   layersValue.textContent = "4";
-  presetInput.value = "balanced";
+  presetInput.value = "safe";
   toggleAdvanced.checked = false;
   forceCpuInput.checked = false;
   setAdvancedEnabled(false);
-  applyPresetValues("balanced");
+  applyPresetValues("safe");
 
   clearError();
   setStatus("Ready for a new image.");
