@@ -129,7 +129,10 @@ def async_decompose(
         update_progress(10, "Decoding image")
         image = _decode_image(image_b64=image_b64)
 
-        update_progress(25, "Preparing inference")
+        update_progress(
+            25,
+            "Preparing inference (model loading/inference may take several minutes, especially in CPU mode)",
+        )
         layers = decompose_image(image=image, num_layers=num_layers, options=options)
 
         update_progress(80, "Saving layer files")

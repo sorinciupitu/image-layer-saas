@@ -2,8 +2,9 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
 const POLL_INTERVAL_MS = 1500;
-const STALL_NO_ACTIVITY_MS = 8 * 60 * 1000;
+const STALL_NO_ACTIVITY_MS = 5 * 60 * 1000;
 const STATUS_FETCH_MAX_DOWNTIME_MS = 3 * 60 * 1000;
+const NO_EVENT_HEARTBEAT_MS = 30 * 1000;
 
 const PRESETS = {
   safe: { resolution: 384, steps: 16, cfg: 2.5 },
@@ -318,6 +319,7 @@ async function pollTask(taskId) {
   let lastState = "";
   let lastEventFingerprint = "";
   let lastActivityAt = Date.now();
+  let lastHeartbeatLogAt = Date.now();
 
   while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
     try {
@@ -351,6 +353,7 @@ async function pollTask(taskId) {
 
       if (changed) {
         lastActivityAt = Date.now();
+        lastHeartbeatLogAt = Date.now();
         appendConsole(`Status=${payload.status} state=${state || "n/a"} progress=${progress}% ${message}`);
         lastStatus = payload.status;
         lastProgress = progress;
@@ -361,6 +364,12 @@ async function pollTask(taskId) {
         throw new Error(
           "Task appears stalled (no status/event changes for several minutes). Retry with Safe preset or Force CPU Mode."
         );
+      } else if (Date.now() - lastHeartbeatLogAt > NO_EVENT_HEARTBEAT_MS) {
+        const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+        appendConsole(
+          `Still processing... (${elapsedSec}s elapsed, no new worker events yet).`
+        );
+        lastHeartbeatLogAt = Date.now();
       }
 
       if (payload.status === "done") {
