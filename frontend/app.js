@@ -3,6 +3,7 @@ const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
 const POLL_INTERVAL_MS = 1500;
 const STATUS_FETCH_RETRY_LIMIT = 20;
+const STALL_NO_ACTIVITY_MS = 8 * 60 * 1000;
 
 const PRESETS = {
   safe: { resolution: 384, steps: 16, cfg: 2.5 },
@@ -256,6 +257,12 @@ async function startDecomposition() {
 async function pollTask(taskId) {
   const startedAt = Date.now();
   let consecutiveStatusFailures = 0;
+  let lastStatus = "";
+  let lastProgress = -1;
+  let lastMessage = "";
+  let lastState = "";
+  let lastEventFingerprint = "";
+  let lastActivityAt = Date.now();
 
   while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
     try {
@@ -270,9 +277,32 @@ async function pollTask(taskId) {
 
       const progress = typeof payload.progress === "number" ? payload.progress : 0;
       const message = payload.message || `Task ${taskId} is ${payload.status}`;
+      const state = payload.state || "";
+      const events = Array.isArray(payload.events) ? payload.events : [];
+      const eventFingerprint = events.join("|");
       showProgress(progress, message);
-      appendEvents(payload.events);
-      appendConsole(`Status=${payload.status} progress=${progress}% ${message}`);
+      appendEvents(events);
+
+      const changed =
+        payload.status !== lastStatus ||
+        progress !== lastProgress ||
+        message !== lastMessage ||
+        state !== lastState ||
+        eventFingerprint !== lastEventFingerprint;
+
+      if (changed) {
+        lastActivityAt = Date.now();
+        appendConsole(`Status=${payload.status} state=${state || "n/a"} progress=${progress}% ${message}`);
+        lastStatus = payload.status;
+        lastProgress = progress;
+        lastMessage = message;
+        lastState = state;
+        lastEventFingerprint = eventFingerprint;
+      } else if (Date.now() - lastActivityAt > STALL_NO_ACTIVITY_MS) {
+        throw new Error(
+          "Task appears stalled (no status/event changes for several minutes). Retry with Safe preset or Force CPU Mode."
+        );
+      }
 
       if (payload.status === "done") {
         showProgress(100, "Decomposition complete.");

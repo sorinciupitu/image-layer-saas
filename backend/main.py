@@ -26,6 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_UPLOAD_MB", "20")) * 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "120"))
+TASK_STALE_SECONDS = int(os.getenv("TASK_STALE_SECONDS", "900"))
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
@@ -120,6 +121,7 @@ async def decompose(
             num_layers=num_layers,
             inference_options=inference_options,
         )
+        _store_task_submission(task.id)
     except Exception as exc:
         LOGGER.exception("Failed to enqueue decomposition task: %s", exc)
         raise HTTPException(
@@ -179,6 +181,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
     progress = _extract_progress(result)
     state_message = _extract_state_message(result)
     events = _extract_events(result)
+    raw_state = str(result.state)
 
     if result.successful() or zip_path.exists():
         payload = _safe_result_payload(result.result) if result.successful() else {}
@@ -192,9 +195,10 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
             "layers": layers,
             "layer_urls": layer_urls,
             "events": payload.get("events", events),
+            "state": raw_state,
         }
 
-    if result.failed():
+    if result.failed() or raw_state == "REVOKED":
         return {
             "task_id": task_id,
             "status": "error",
@@ -202,10 +206,31 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
             "message": state_message,
             "error": _extract_task_error(result),
             "events": events,
+            "state": raw_state,
+        }
+
+    age_seconds = _get_task_submission_age_seconds(task_id)
+    if age_seconds is not None and age_seconds > TASK_STALE_SECONDS and raw_state in {
+        "PENDING",
+        "STARTED",
+        "PROGRESS",
+        "RETRY",
+    }:
+        return {
+            "task_id": task_id,
+            "status": "error",
+            "progress": progress,
+            "message": state_message or "Task appears stalled",
+            "error": (
+                f"Task appears stalled after {age_seconds}s in state {raw_state}. "
+                "Please retry with Safe preset or Force CPU Mode."
+            ),
+            "events": events,
+            "state": raw_state,
         }
 
     mapped_status: Literal["pending", "processing"] = (
-        "processing" if result.state in {"STARTED", "RETRY", "PROGRESS"} else "pending"
+        "processing" if raw_state in {"STARTED", "RETRY", "PROGRESS"} else "pending"
     )
     return {
         "task_id": task_id,
@@ -213,6 +238,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
         "progress": progress,
         "message": state_message,
         "events": events,
+        "state": raw_state,
     }
 
 
@@ -399,3 +425,30 @@ def _get_gpu_info() -> dict[str, Any]:
         "vram_used_mb": round(used_bytes / (1024 * 1024), 2),
         "vram_total_mb": round(total_bytes / (1024 * 1024), 2),
     }
+
+
+def _store_task_submission(task_id: str) -> None:
+    try:
+        backend = celery_app.backend
+        client = getattr(backend, "client", None)
+        if client is None:
+            return
+        client.setex(f"task:submitted:{task_id}", 60 * 60 * 24, str(int(time.time())))
+    except Exception as exc:
+        LOGGER.warning("Could not store task submission timestamp for %s: %s", task_id, exc)
+
+
+def _get_task_submission_age_seconds(task_id: str) -> int | None:
+    try:
+        backend = celery_app.backend
+        client = getattr(backend, "client", None)
+        if client is None:
+            return None
+        raw_value = client.get(f"task:submitted:{task_id}")
+        if raw_value is None:
+            return None
+        created_ts = int(raw_value.decode("utf-8") if isinstance(raw_value, bytes) else raw_value)
+        return max(0, int(time.time()) - created_ts)
+    except Exception as exc:
+        LOGGER.warning("Could not read task submission timestamp for %s: %s", task_id, exc)
+        return None

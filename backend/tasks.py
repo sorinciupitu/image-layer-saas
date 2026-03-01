@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from celery import Celery
+from celery.exceptions import SoftTimeLimitExceeded
 from PIL import Image, UnidentifiedImageError
 
 from model import decompose_image
@@ -35,6 +36,15 @@ celery_app.conf.update(
     result_serializer="json",
     accept_content=["json"],
     result_expires=OUTPUT_RETENTION_SECONDS,
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    task_acks_on_failure_or_timeout=False,
+    worker_prefetch_multiplier=1,
+    task_soft_time_limit=int(os.getenv("TASK_SOFT_TIME_LIMIT_SECONDS", "1800")),
+    task_time_limit=int(os.getenv("TASK_HARD_TIME_LIMIT_SECONDS", "2100")),
+    broker_transport_options={
+        "visibility_timeout": int(os.getenv("BROKER_VISIBILITY_TIMEOUT_SECONDS", "3600")),
+    },
     timezone="UTC",
     enable_utc=True,
 )
@@ -128,6 +138,12 @@ def async_decompose(
 
         update_progress(95, "Finalizing output")
         schedule_cleanup(task_dir=task_dir)
+    except SoftTimeLimitExceeded as exc:
+        cleanup_task_dir(task_dir)
+        LOGGER.exception("Task %s timed out: %s", task_id, exc)
+        raise RuntimeError(
+            "Task exceeded execution time limit. Reduce resolution/steps or enable Force CPU Mode."
+        ) from exc
     except Exception as exc:
         cleanup_task_dir(task_dir)
         LOGGER.exception("Task %s failed: %s", task_id, exc)
