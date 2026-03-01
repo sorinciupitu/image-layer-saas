@@ -2,8 +2,8 @@ const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
 const POLL_INTERVAL_MS = 1500;
-const STATUS_FETCH_RETRY_LIMIT = 20;
 const STALL_NO_ACTIVITY_MS = 8 * 60 * 1000;
+const STATUS_FETCH_MAX_DOWNTIME_MS = 3 * 60 * 1000;
 
 const PRESETS = {
   safe: { resolution: 384, steps: 16, cfg: 2.5 },
@@ -118,10 +118,14 @@ function bindActionEvents() {
     appendConsole(`Custom tuning ${toggleAdvanced.checked ? "enabled" : "disabled"}.`);
   });
 
-  clearConsoleBtn.addEventListener("click", () => {
-    runtimeConsole.textContent = "";
-    appendConsole("Console cleared.");
-  });
+  if (clearConsoleBtn) {
+    clearConsoleBtn.addEventListener("click", () => {
+      if (runtimeConsole) {
+        runtimeConsole.textContent = "";
+      }
+      appendConsole("Console cleared.");
+    });
+  }
 
   resetBtn.addEventListener("click", () => resetState());
 
@@ -258,6 +262,7 @@ async function startDecomposition() {
 async function pollTask(taskId) {
   const startedAt = Date.now();
   let consecutiveStatusFailures = 0;
+  let lastSuccessfulStatusAt = Date.now();
   let lastStatus = "";
   let lastProgress = -1;
   let lastMessage = "";
@@ -267,13 +272,17 @@ async function pollTask(taskId) {
 
   while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
     try {
-      const response = await fetch(`/api/status/${taskId}`, { method: "GET" });
+      const response = await fetch(`/api/status/${taskId}`, {
+        method: "GET",
+        cache: "no-store",
+      });
       if (!response.ok) {
         const payload = await safeJson(response);
         throw new Error(payload.detail || `Status request failed (${response.status})`);
       }
 
       const payload = await safeJson(response);
+      lastSuccessfulStatusAt = Date.now();
       consecutiveStatusFailures = 0;
 
       const progress = typeof payload.progress === "number" ? payload.progress : 0;
@@ -319,9 +328,14 @@ async function pollTask(taskId) {
     } catch (error) {
       consecutiveStatusFailures += 1;
       const message = error instanceof Error ? error.message : "Unknown status error";
-      appendConsole(`Status fetch issue (${consecutiveStatusFailures}/${STATUS_FETCH_RETRY_LIMIT}): ${message}`);
-      if (consecutiveStatusFailures >= STATUS_FETCH_RETRY_LIMIT) {
-        throw new Error(`Failed to fetch task status repeatedly. Last error: ${message}`);
+      appendConsole(`Status fetch issue (${consecutiveStatusFailures}): ${message}`);
+      setStatus("Status connection interrupted. Retrying...");
+      if (Date.now() - lastSuccessfulStatusAt > STATUS_FETCH_MAX_DOWNTIME_MS) {
+        throw new Error(
+          `Status endpoint unreachable for over ${Math.floor(
+            STATUS_FETCH_MAX_DOWNTIME_MS / 60000
+          )} minutes. Check backend container health. Last error: ${message}`
+        );
       }
     }
 
@@ -475,9 +489,18 @@ function resetState() {
 }
 
 function appendConsole(message) {
+  const line = String(message || "").trim();
+  if (!line) {
+    return;
+  }
   const timestamp = new Date().toLocaleTimeString();
-  runtimeConsole.textContent += `[${timestamp}] ${message}\n`;
-  runtimeConsole.scrollTop = runtimeConsole.scrollHeight;
+  if (runtimeConsole) {
+    runtimeConsole.textContent += `[${timestamp}] ${line}\n`;
+    runtimeConsole.scrollTop = runtimeConsole.scrollHeight;
+    return;
+  }
+  // Fallback so diagnostics are never silently dropped.
+  console.log(`[${timestamp}] ${line}`);
 }
 
 async function safeJson(response) {
