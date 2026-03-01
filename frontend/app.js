@@ -44,9 +44,58 @@ let activeTaskId = null;
 let isProcessing = false;
 let seenEvents = new Set();
 
+window.addEventListener("error", (event) => {
+  appendConsole(`JS ERROR: ${event.message} @ ${event.filename || "unknown"}:${event.lineno || 0}`);
+  setStatus("Frontend error detected. Check Runtime Console.");
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event && event.reason ? String(event.reason) : "Unknown promise rejection";
+  appendConsole(`UNHANDLED PROMISE: ${reason}`);
+  setStatus("Frontend promise error detected. Check Runtime Console.");
+});
+
 initialize();
 
 function initialize() {
+  if (runtimeConsole) {
+    runtimeConsole.textContent = "";
+  }
+  appendConsole("Frontend script loaded.");
+
+  const required = [
+    ["fileInput", fileInput],
+    ["dropZone", dropZone],
+    ["layersInput", layersInput],
+    ["layersValue", layersValue],
+    ["presetInput", presetInput],
+    ["toggleAdvanced", toggleAdvanced],
+    ["resolutionInput", resolutionInput],
+    ["stepsInput", stepsInput],
+    ["cfgInput", cfgInput],
+    ["forceCpuInput", forceCpuInput],
+    ["decomposeBtn", decomposeBtn],
+    ["resetBtn", resetBtn],
+    ["progressWrap", progressWrap],
+    ["progressFill", progressFill],
+    ["progressPercent", progressPercent],
+    ["progressLabel", progressLabel],
+    ["statusText", statusText],
+    ["errorText", errorText],
+    ["previewShell", previewShell],
+    ["previewImage", previewImage],
+    ["previewPlaceholder", previewPlaceholder],
+    ["resultsSection", resultsSection],
+    ["gallery", gallery],
+    ["downloadZip", downloadZip],
+  ];
+  const missing = required.filter(([, el]) => !el).map(([name]) => name);
+  if (missing.length > 0) {
+    appendConsole(`Missing DOM nodes: ${missing.join(", ")}`);
+    setStatus("UI assets mismatch. Hard refresh (Ctrl+F5) and retry.");
+    return;
+  }
+
   layersValue.textContent = layersInput.value;
   presetInput.value = "safe";
   applyPresetValues("safe");
