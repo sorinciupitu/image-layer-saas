@@ -19,6 +19,7 @@ const toggleAdvanced = document.getElementById("toggle-advanced");
 const resolutionInput = document.getElementById("resolution");
 const stepsInput = document.getElementById("inference-steps");
 const cfgInput = document.getElementById("cfg-scale");
+const forceCpuInput = document.getElementById("force-cpu");
 const decomposeBtn = document.getElementById("decompose-btn");
 const resetBtn = document.getElementById("reset-btn");
 const progressWrap = document.getElementById("progress-wrap");
@@ -184,8 +185,10 @@ function renderPreview(file) {
 
 function collectInferenceOptions() {
   const preset = presetInput.value;
+  const deviceMode = forceCpuInput.checked ? "cpu" : "auto";
   const options = {
     inference_preset: preset,
+    device_mode: deviceMode,
     resolution: resolutionInput.value,
     num_inference_steps: stepsInput.value,
     true_cfg_scale: cfgInput.value,
@@ -216,7 +219,7 @@ async function startDecomposition() {
   const options = collectInferenceOptions();
   Object.entries(options).forEach(([key, value]) => formData.append(key, String(value)));
   appendConsole(
-    `Inference config: preset=${options.inference_preset}, resolution=${options.resolution}, steps=${options.num_inference_steps}, cfg=${options.true_cfg_scale}.`
+    `Inference config: preset=${options.inference_preset}, mode=${options.device_mode}, resolution=${options.resolution}, steps=${options.num_inference_steps}, cfg=${options.true_cfg_scale}.`
   );
 
   try {
@@ -419,6 +422,7 @@ function resetState() {
   layersValue.textContent = "4";
   presetInput.value = "balanced";
   toggleAdvanced.checked = false;
+  forceCpuInput.checked = false;
   setAdvancedEnabled(false);
   applyPresetValues("balanced");
 

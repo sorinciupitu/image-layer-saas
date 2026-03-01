@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import gc
 import inspect
 import logging
 import os
@@ -41,6 +42,7 @@ class InferenceOptions:
     true_cfg_scale: float
     use_en_prompt: bool
     cfg_normalize: bool
+    device_mode: str
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> "InferenceOptions":
@@ -50,6 +52,9 @@ class InferenceOptions:
         cfg = _coerce_float(data.get("true_cfg_scale"), DEFAULT_CFG_SCALE)
         use_en_prompt = _coerce_bool(data.get("use_en_prompt"), True)
         cfg_normalize = _coerce_bool(data.get("cfg_normalize"), True)
+        device_mode = _coerce_str(data.get("device_mode"), "auto").lower()
+        if device_mode not in {"auto", "cpu", "cuda", "balanced"}:
+            device_mode = "auto"
 
         steps = max(8, min(80, steps))
         resolution = max(256, min(1024, resolution))
@@ -62,7 +67,17 @@ class InferenceOptions:
             true_cfg_scale=cfg,
             use_en_prompt=use_en_prompt,
             cfg_normalize=cfg_normalize,
+            device_mode=device_mode,
         )
+
+
+@dataclass(frozen=True)
+class PipelineLoadConfig:
+    execution_device: str
+    device_map: str
+    torch_dtype: torch.dtype
+    low_vram_mode: bool
+    use_variant_fp16: bool
 
 
 class LayerDecompositionModel:
@@ -72,12 +87,14 @@ class LayerDecompositionModel:
     def __init__(self, model_id: str = DEFAULT_MODEL_ID) -> None:
         self.model_id = model_id
         self._pipeline: Any | None = None
+        self._pipeline_config: PipelineLoadConfig | None = None
         self._load_lock = threading.Lock()
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        self._dtype = torch.float16 if self._device == "cuda" else torch.float32
+        self._cuda_available = torch.cuda.is_available()
+        self._device = "cuda" if self._cuda_available else "cpu"
+        self._dtype = torch.float16 if self._cuda_available else torch.float32
         self._allow_fallback = ENABLE_HEURISTIC_FALLBACK
         self._cuda_vram_gb = self._detect_cuda_vram_gb()
-        self._low_vram_mode = self._device == "cuda" and self._cuda_vram_gb < LOW_VRAM_THRESHOLD_GB
+        self._low_vram_mode = self._cuda_available and self._cuda_vram_gb < LOW_VRAM_THRESHOLD_GB
 
     @classmethod
     def instance(cls, model_id: str = DEFAULT_MODEL_ID) -> "LayerDecompositionModel":
@@ -90,25 +107,30 @@ class LayerDecompositionModel:
         return self._pipeline is not None
 
     def runtime_info(self) -> ModelRuntimeInfo:
+        active_device = self._pipeline_config.execution_device if self._pipeline_config else self._device
+        active_dtype = self._pipeline_config.torch_dtype if self._pipeline_config else self._dtype
         return ModelRuntimeInfo(
             model_id=self.model_id,
-            device=self._device,
-            dtype=str(self._dtype).replace("torch.", ""),
+            device=active_device,
+            dtype=str(active_dtype).replace("torch.", ""),
             loaded=self.is_loaded(),
         )
 
-    def ensure_loaded(self) -> None:
-        if self._pipeline is not None:
+    def ensure_loaded(self, config: PipelineLoadConfig) -> None:
+        if self._pipeline is not None and self._pipeline_config == config:
             return
         with self._load_lock:
-            if self._pipeline is not None:
+            if self._pipeline is not None and self._pipeline_config == config:
                 return
-            self._pipeline = self._load_pipeline()
+            self._unload_pipeline_if_needed()
+            self._pipeline = self._load_pipeline(config=config)
+            self._pipeline_config = config
             LOGGER.info(
-                "Loaded decomposition model '%s' on %s with dtype=%s",
+                "Loaded decomposition model '%s' on %s (device_map=%s) with dtype=%s",
                 self.model_id,
-                self._device,
-                self._dtype,
+                config.execution_device,
+                config.device_map,
+                config.torch_dtype,
             )
 
     def decompose_image(
@@ -122,10 +144,11 @@ class LayerDecompositionModel:
 
         rgba_image = image.convert("RGBA")
         inference_options = InferenceOptions.from_raw(options)
+        pipeline_config = self._resolve_pipeline_config(inference_options.device_mode)
         started_at = time.perf_counter()
 
         try:
-            self.ensure_loaded()
+            self.ensure_loaded(config=pipeline_config)
             layers = self._run_model_inference(
                 image=rgba_image,
                 num_layers=num_layers,
@@ -143,7 +166,7 @@ class LayerDecompositionModel:
         LOGGER.info("Image decomposition completed in %.2fs (layers=%d)", elapsed, len(layers))
         return layers
 
-    def _load_pipeline(self) -> Any:
+    def _load_pipeline(self, config: PipelineLoadConfig) -> Any:
         self._apply_torch_custom_op_compatibility_shim()
         try:
             from diffusers import QwenImageLayeredPipeline
@@ -155,15 +178,13 @@ class LayerDecompositionModel:
             ) from exc
 
         load_kwargs: dict[str, Any] = {
-            "torch_dtype": self._dtype,
+            "torch_dtype": config.torch_dtype,
             "low_cpu_mem_usage": True,
+            "device_map": config.device_map,
         }
 
-        if self._device == "cuda":
-            load_kwargs["device_map"] = "balanced" if self._low_vram_mode else "cuda"
+        if config.use_variant_fp16:
             load_kwargs["variant"] = "fp16"
-        else:
-            load_kwargs["device_map"] = "cpu"
 
         try:
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
@@ -178,7 +199,7 @@ class LayerDecompositionModel:
             load_kwargs.pop("variant", None)
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
 
-        if self._device == "cuda" and not load_kwargs.get("device_map"):
+        if config.execution_device == "cuda" and not load_kwargs.get("device_map"):
             pipeline.to("cuda")
             if hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
                 try:
@@ -186,7 +207,7 @@ class LayerDecompositionModel:
                 except Exception:
                     LOGGER.debug("xFormers optimization not available for this pipeline")
 
-        if self._low_vram_mode and hasattr(pipeline, "enable_model_cpu_offload"):
+        if config.low_vram_mode and hasattr(pipeline, "enable_model_cpu_offload"):
             try:
                 pipeline.enable_model_cpu_offload()
                 LOGGER.warning(
@@ -198,6 +219,56 @@ class LayerDecompositionModel:
                 LOGGER.warning("Failed to enable model CPU offload: %s", exc)
 
         return pipeline
+
+    def _resolve_pipeline_config(self, device_mode: str) -> PipelineLoadConfig:
+        mode = device_mode.lower()
+        if mode == "cpu" or not self._cuda_available:
+            return PipelineLoadConfig(
+                execution_device="cpu",
+                device_map="cpu",
+                torch_dtype=torch.float32,
+                low_vram_mode=False,
+                use_variant_fp16=False,
+            )
+
+        if mode == "cuda":
+            return PipelineLoadConfig(
+                execution_device="cuda",
+                device_map="cuda",
+                torch_dtype=torch.float16,
+                low_vram_mode=False,
+                use_variant_fp16=True,
+            )
+
+        if mode == "balanced":
+            return PipelineLoadConfig(
+                execution_device="cuda",
+                device_map="balanced",
+                torch_dtype=torch.float16,
+                low_vram_mode=True,
+                use_variant_fp16=True,
+            )
+
+        auto_balanced = self._low_vram_mode
+        return PipelineLoadConfig(
+            execution_device="cuda",
+            device_map="balanced" if auto_balanced else "cuda",
+            torch_dtype=torch.float16,
+            low_vram_mode=auto_balanced,
+            use_variant_fp16=True,
+        )
+
+    def _unload_pipeline_if_needed(self) -> None:
+        if self._pipeline is None:
+            return
+        try:
+            self._pipeline = None
+            self._pipeline_config = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            LOGGER.warning("Failed to cleanup previous pipeline instance: %s", exc)
 
     def _detect_cuda_vram_gb(self) -> float:
         if not torch.cuda.is_available():
@@ -275,9 +346,10 @@ class LayerDecompositionModel:
             raise RuntimeError("Model pipeline is not loaded")
 
         kwargs = self._build_inference_kwargs(image=image, num_layers=num_layers, options=options)
+        active_config = self._pipeline_config or self._resolve_pipeline_config(options.device_mode)
         output: Any
         with torch.inference_mode():
-            if self._device == "cuda":
+            if active_config.execution_device == "cuda":
                 with torch.autocast(device_type="cuda", dtype=torch.float16):
                     output = self._pipeline(**kwargs)
             else:
@@ -539,3 +611,9 @@ def _coerce_bool(value: Any, default: bool) -> bool:
         if lowered in {"0", "false", "no", "off"}:
             return False
     return default
+
+
+def _coerce_str(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    return str(value)

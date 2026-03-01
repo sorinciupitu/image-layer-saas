@@ -85,6 +85,7 @@ async def decompose(
     image: UploadFile = File(...),
     num_layers: int = Form(default=4),
     inference_preset: str = Form(default="balanced"),
+    device_mode: str = Form(default="auto"),
     resolution: int = Form(default=512),
     num_inference_steps: int = Form(default=24),
     true_cfg_scale: float = Form(default=3.0),
@@ -95,6 +96,7 @@ async def decompose(
     _validate_upload_metadata(upload=image)
     inference_options = _build_inference_options(
         inference_preset=inference_preset,
+        device_mode=device_mode,
         resolution=resolution,
         num_inference_steps=num_inference_steps,
         true_cfg_scale=true_cfg_scale,
@@ -330,6 +332,7 @@ def _build_layer_urls(request: Request, task_id: str, layers: list[str]) -> list
 
 def _build_inference_options(
     inference_preset: str,
+    device_mode: str,
     resolution: int,
     num_inference_steps: int,
     true_cfg_scale: float,
@@ -346,9 +349,14 @@ def _build_inference_options(
     if preset not in preset_map:
         raise HTTPException(status_code=422, detail="inference_preset must be one of: safe, balanced, quality, custom")
 
+    mode = device_mode.strip().lower()
+    if mode not in {"auto", "cpu", "cuda", "balanced"}:
+        raise HTTPException(status_code=422, detail="device_mode must be one of: auto, cpu, cuda, balanced")
+
     options: dict[str, Any] = {
         "use_en_prompt": use_en_prompt,
         "cfg_normalize": cfg_normalize,
+        "device_mode": mode,
     }
     options.update(preset_map[preset])
     if preset == "custom":
