@@ -1,6 +1,6 @@
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
 const ACCEPTED_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
-const PROCESSING_TIMEOUT_MS = 30 * 60 * 1000;
+const PROCESSING_TIMEOUT_MS = 90 * 60 * 1000;
 const POLL_INTERVAL_MS = 1500;
 const STALL_NO_ACTIVITY_MS = 5 * 60 * 1000;
 const STATUS_FETCH_MAX_DOWNTIME_MS = 3 * 60 * 1000;
@@ -321,6 +321,7 @@ async function pollTask(taskId) {
   let lastEventFingerprint = "";
   let lastActivityAt = Date.now();
   let lastHeartbeatLogAt = Date.now();
+  let lastStallNoticeAt = 0;
 
   while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
     let payload;
@@ -377,14 +378,20 @@ async function pollTask(taskId) {
       lastMessage = message;
       lastState = state;
       lastEventFingerprint = eventFingerprint;
-    } else if (Date.now() - lastActivityAt > STALL_NO_ACTIVITY_MS) {
-      throw new Error(
-        "Task appears stalled (no status/event changes for several minutes). Retry with Safe preset or Force CPU Mode."
-      );
-    } else if (Date.now() - lastHeartbeatLogAt > NO_EVENT_HEARTBEAT_MS) {
-      const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-      appendConsole(`Still processing... (${elapsedSec}s elapsed, no new worker events yet).`);
-      lastHeartbeatLogAt = Date.now();
+    } else {
+      const now = Date.now();
+      if (now - lastActivityAt > STALL_NO_ACTIVITY_MS && now - lastStallNoticeAt > NO_EVENT_HEARTBEAT_MS) {
+        const idleSec = Math.max(1, Math.floor((now - lastActivityAt) / 1000));
+        appendConsole(
+          `No new status/event changes for ${idleSec}s, but task is still active. Waiting for next worker heartbeat...`
+        );
+        setStatus("Processing... first run can take longer while model files are loaded.");
+        lastStallNoticeAt = now;
+      } else if (now - lastHeartbeatLogAt > NO_EVENT_HEARTBEAT_MS) {
+        const elapsedSec = Math.max(1, Math.floor((now - startedAt) / 1000));
+        appendConsole(`Still processing... (${elapsedSec}s elapsed, no new worker events yet).`);
+        lastHeartbeatLogAt = now;
+      }
     }
 
     if (payload.status === "done") {

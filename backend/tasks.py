@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,7 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/1")
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "/tmp/output"))
 OUTPUT_RETENTION_SECONDS = int(os.getenv("OUTPUT_RETENTION_SECONDS", "3600"))
+INFERENCE_HEARTBEAT_SECONDS = int(os.getenv("INFERENCE_HEARTBEAT_SECONDS", "20"))
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -113,17 +115,20 @@ def async_decompose(
     task_dir.mkdir(parents=True, exist_ok=True)
     options = inference_options or {}
     events: list[str] = []
+    progress_lock = threading.Lock()
 
     def update_progress(progress: int, message: str) -> None:
-        events.append(message)
-        self.update_state(
-            state="PROGRESS",
-            meta={
-                "progress": progress,
-                "message": message,
-                "events": events[-20:],
-            },
-        )
+        with progress_lock:
+            events.append(message)
+            self.update_state(
+                state="PROGRESS",
+                meta={
+                    "progress": progress,
+                    "message": message,
+                    "events": events[-20:],
+                    "updated_at": int(time.time()),
+                },
+            )
 
     try:
         update_progress(10, "Decoding image")
@@ -133,7 +138,26 @@ def async_decompose(
             25,
             "Preparing inference (model loading/inference may take several minutes, especially in CPU mode)",
         )
-        layers = decompose_image(image=image, num_layers=num_layers, options=options)
+        heartbeat_stop = threading.Event()
+        inference_started_at = time.monotonic()
+
+        def heartbeat_loop() -> None:
+            while not heartbeat_stop.wait(INFERENCE_HEARTBEAT_SECONDS):
+                elapsed_seconds = int(time.monotonic() - inference_started_at)
+                heartbeat_progress = min(70, 25 + max(0, elapsed_seconds // 20))
+                update_progress(
+                    int(heartbeat_progress),
+                    f"Inference running ({elapsed_seconds}s elapsed, first run may download model files)",
+                )
+
+        heartbeat_thread = threading.Thread(target=heartbeat_loop, name=f"inference-heartbeat-{task_id}")
+        heartbeat_thread.daemon = True
+        heartbeat_thread.start()
+        try:
+            layers = decompose_image(image=image, num_layers=num_layers, options=options)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
 
         update_progress(80, "Saving layer files")
         layer_paths = _save_layers(task_dir=task_dir, layers=layers)

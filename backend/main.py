@@ -181,6 +181,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
     progress = _extract_progress(result)
     state_message = _extract_state_message(result)
     events = _extract_events(result)
+    updated_age_seconds = _get_task_update_age_seconds(result)
     raw_state = str(result.state)
 
     if result.successful() or zip_path.exists():
@@ -210,7 +211,13 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
         }
 
     age_seconds = _get_task_submission_age_seconds(task_id)
-    if age_seconds is not None and age_seconds > TASK_STALE_SECONDS and raw_state in {
+    stale_age_seconds: int | None = None
+    if raw_state == "PENDING":
+        stale_age_seconds = age_seconds
+    elif raw_state in {"STARTED", "PROGRESS", "RETRY"}:
+        stale_age_seconds = updated_age_seconds if updated_age_seconds is not None else age_seconds
+
+    if stale_age_seconds is not None and stale_age_seconds > TASK_STALE_SECONDS and raw_state in {
         "PENDING",
         "STARTED",
         "PROGRESS",
@@ -222,7 +229,7 @@ async def task_status(request: Request, task_id: str) -> dict[str, Any]:
             "progress": progress,
             "message": state_message or "Task appears stalled",
             "error": (
-                f"Task appears stalled after {age_seconds}s in state {raw_state}. "
+                f"Task appears stalled (no updates for {stale_age_seconds}s, state={raw_state}). "
                 "Please retry with Safe preset or Force CPU Mode."
             ),
             "events": events,
@@ -341,6 +348,18 @@ def _extract_events(result: AsyncResult) -> list[str]:
     if not isinstance(raw_events, list):
         return []
     return [str(item) for item in raw_events][-20:]
+
+
+def _get_task_update_age_seconds(result: AsyncResult) -> int | None:
+    meta = result.info if isinstance(result.info, dict) else {}
+    raw_updated_at = meta.get("updated_at")
+    try:
+        if raw_updated_at is None:
+            return None
+        updated_ts = int(raw_updated_at)
+        return max(0, int(time.time()) - updated_ts)
+    except (TypeError, ValueError):
+        return None
 
 
 def _discover_layer_files(task_id: str) -> list[str]:

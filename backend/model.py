@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 import torch
@@ -25,6 +25,7 @@ LOW_VRAM_THRESHOLD_GB = float(os.getenv("LOW_VRAM_THRESHOLD_GB", "20"))
 DEFAULT_INFERENCE_STEPS = int(os.getenv("DEFAULT_INFERENCE_STEPS", "24"))
 DEFAULT_RESOLUTION = int(os.getenv("DEFAULT_RESOLUTION", "512"))
 DEFAULT_CFG_SCALE = float(os.getenv("DEFAULT_CFG_SCALE", "3.0"))
+DEFAULT_CPU_TORCH_DTYPE = os.getenv("CPU_TORCH_DTYPE", "bfloat16").strip().lower()
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,22 @@ class PipelineLoadConfig:
     use_variant_fp16: bool
 
 
+def _resolve_cpu_torch_dtype() -> torch.dtype:
+    dtype_map: dict[str, torch.dtype] = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if DEFAULT_CPU_TORCH_DTYPE in dtype_map:
+        return dtype_map[DEFAULT_CPU_TORCH_DTYPE]
+    LOGGER.warning(
+        "Unsupported CPU_TORCH_DTYPE=%s. Falling back to bfloat16.",
+        DEFAULT_CPU_TORCH_DTYPE,
+    )
+    return torch.bfloat16
+
+
 class LayerDecompositionModel:
     _instance: "LayerDecompositionModel | None" = None
     _instance_lock = threading.Lock()
@@ -90,8 +107,9 @@ class LayerDecompositionModel:
         self._pipeline_config: PipelineLoadConfig | None = None
         self._load_lock = threading.Lock()
         self._cuda_available = torch.cuda.is_available()
+        self._cpu_dtype = _resolve_cpu_torch_dtype()
         self._device = "cuda" if self._cuda_available else "cpu"
-        self._dtype = torch.float16 if self._cuda_available else torch.float32
+        self._dtype = torch.float16 if self._cuda_available else self._cpu_dtype
         self._allow_fallback = ENABLE_HEURISTIC_FALLBACK
         self._cuda_vram_gb = self._detect_cuda_vram_gb()
         self._low_vram_mode = self._cuda_available and self._cuda_vram_gb < LOW_VRAM_THRESHOLD_GB
@@ -123,14 +141,15 @@ class LayerDecompositionModel:
             if self._pipeline is not None and self._pipeline_config == config:
                 return
             self._unload_pipeline_if_needed()
-            self._pipeline = self._load_pipeline(config=config)
-            self._pipeline_config = config
+            pipeline, effective_config = self._load_pipeline(config=config)
+            self._pipeline = pipeline
+            self._pipeline_config = effective_config
             LOGGER.info(
                 "Loaded decomposition model '%s' on %s (device_map=%s) with dtype=%s",
                 self.model_id,
-                config.execution_device,
-                config.device_map,
-                config.torch_dtype,
+                effective_config.execution_device,
+                effective_config.device_map,
+                effective_config.torch_dtype,
             )
 
     def decompose_image(
@@ -166,7 +185,7 @@ class LayerDecompositionModel:
         LOGGER.info("Image decomposition completed in %.2fs (layers=%d)", elapsed, len(layers))
         return layers
 
-    def _load_pipeline(self, config: PipelineLoadConfig) -> Any:
+    def _load_pipeline(self, config: PipelineLoadConfig) -> tuple[Any, PipelineLoadConfig]:
         self._apply_torch_custom_op_compatibility_shim()
         try:
             from diffusers import QwenImageLayeredPipeline
@@ -186,20 +205,32 @@ class LayerDecompositionModel:
         if config.use_variant_fp16:
             load_kwargs["variant"] = "fp16"
 
+        effective_config = config
         try:
             pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
         except Exception as exc:
-            if "variant" not in load_kwargs:
+            if config.execution_device == "cpu" and config.torch_dtype != torch.float32:
+                LOGGER.warning(
+                    "Failed to load CPU pipeline with dtype=%s (%s). Retrying with float32.",
+                    config.torch_dtype,
+                    exc,
+                )
+                load_kwargs.pop("variant", None)
+                load_kwargs["torch_dtype"] = torch.float32
+                pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
+                effective_config = replace(config, torch_dtype=torch.float32, use_variant_fp16=False)
+            elif "variant" in load_kwargs:
+                LOGGER.warning(
+                    "Failed to load model with variant=%s (%s). Retrying without variant.",
+                    load_kwargs.get("variant"),
+                    exc,
+                )
+                load_kwargs.pop("variant", None)
+                pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
+            else:
                 raise
-            LOGGER.warning(
-                "Failed to load model with variant=%s (%s). Retrying without variant.",
-                load_kwargs.get("variant"),
-                exc,
-            )
-            load_kwargs.pop("variant", None)
-            pipeline = QwenImageLayeredPipeline.from_pretrained(self.model_id, **load_kwargs)
 
-        if config.execution_device == "cuda" and not load_kwargs.get("device_map"):
+        if effective_config.execution_device == "cuda" and not load_kwargs.get("device_map"):
             pipeline.to("cuda")
             if hasattr(pipeline, "enable_xformers_memory_efficient_attention"):
                 try:
@@ -207,7 +238,7 @@ class LayerDecompositionModel:
                 except Exception:
                     LOGGER.debug("xFormers optimization not available for this pipeline")
 
-        if config.low_vram_mode and hasattr(pipeline, "enable_model_cpu_offload"):
+        if effective_config.low_vram_mode and hasattr(pipeline, "enable_model_cpu_offload"):
             try:
                 pipeline.enable_model_cpu_offload()
                 LOGGER.warning(
@@ -218,7 +249,7 @@ class LayerDecompositionModel:
             except Exception as exc:
                 LOGGER.warning("Failed to enable model CPU offload: %s", exc)
 
-        return pipeline
+        return pipeline, effective_config
 
     def _resolve_pipeline_config(self, device_mode: str) -> PipelineLoadConfig:
         mode = device_mode.lower()
@@ -226,7 +257,7 @@ class LayerDecompositionModel:
             return PipelineLoadConfig(
                 execution_device="cpu",
                 device_map="cpu",
-                torch_dtype=torch.float32,
+                torch_dtype=self._cpu_dtype,
                 low_vram_mode=False,
                 use_variant_fp16=False,
             )
