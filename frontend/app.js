@@ -323,67 +323,20 @@ async function pollTask(taskId) {
   let lastHeartbeatLogAt = Date.now();
 
   while (Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
+    let payload;
     try {
       const response = await fetch(`/api/status/${taskId}`, {
         method: "GET",
         cache: "no-store",
       });
       if (!response.ok) {
-        const payload = await safeJson(response);
-        throw new Error(payload.detail || `Status request failed (${response.status})`);
+        const failurePayload = await safeJson(response);
+        throw new Error(failurePayload.detail || `Status request failed (${response.status})`);
       }
 
-      const payload = await safeJson(response);
+      payload = await safeJson(response);
       lastSuccessfulStatusAt = Date.now();
       consecutiveStatusFailures = 0;
-
-      const progress = typeof payload.progress === "number" ? payload.progress : 0;
-      const message = payload.message || `Task ${taskId} is ${payload.status}`;
-      const state = payload.state || "";
-      const events = Array.isArray(payload.events) ? payload.events : [];
-      const eventFingerprint = events.join("|");
-      showProgress(progress, message);
-      appendEvents(events);
-
-      const changed =
-        payload.status !== lastStatus ||
-        progress !== lastProgress ||
-        message !== lastMessage ||
-        state !== lastState ||
-        eventFingerprint !== lastEventFingerprint;
-
-      if (changed) {
-        lastActivityAt = Date.now();
-        lastHeartbeatLogAt = Date.now();
-        appendConsole(`Status=${payload.status} state=${state || "n/a"} progress=${progress}% ${message}`);
-        lastStatus = payload.status;
-        lastProgress = progress;
-        lastMessage = message;
-        lastState = state;
-        lastEventFingerprint = eventFingerprint;
-      } else if (Date.now() - lastActivityAt > STALL_NO_ACTIVITY_MS) {
-        throw new Error(
-          "Task appears stalled (no status/event changes for several minutes). Retry with Safe preset or Force CPU Mode."
-        );
-      } else if (Date.now() - lastHeartbeatLogAt > NO_EVENT_HEARTBEAT_MS) {
-        const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
-        appendConsole(
-          `Still processing... (${elapsedSec}s elapsed, no new worker events yet).`
-        );
-        lastHeartbeatLogAt = Date.now();
-      }
-
-      if (payload.status === "done") {
-        showProgress(100, "Decomposition complete.");
-        renderResults(payload);
-        setStatus("Layers are ready. Preview and download below.");
-        appendConsole("Task completed successfully.");
-        return;
-      }
-
-      if (payload.status === "error") {
-        throw new Error(payload.error || "Task failed");
-      }
     } catch (error) {
       consecutiveStatusFailures += 1;
       const message = error instanceof Error ? error.message : "Unknown status error";
@@ -396,13 +349,61 @@ async function pollTask(taskId) {
           )} minutes. Check backend container health. Last error: ${message}`
         );
       }
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
+    const progress = typeof payload.progress === "number" ? payload.progress : 0;
+    const message = payload.message || `Task ${taskId} is ${payload.status}`;
+    const state = payload.state || "";
+    const events = Array.isArray(payload.events) ? payload.events : [];
+    const eventFingerprint = events.join("|");
+    showProgress(progress, message);
+    appendEvents(events);
+
+    const changed =
+      payload.status !== lastStatus ||
+      progress !== lastProgress ||
+      message !== lastMessage ||
+      state !== lastState ||
+      eventFingerprint !== lastEventFingerprint;
+
+    if (changed) {
+      lastActivityAt = Date.now();
+      lastHeartbeatLogAt = Date.now();
+      appendConsole(`Status=${payload.status} state=${state || "n/a"} progress=${progress}% ${message}`);
+      lastStatus = payload.status;
+      lastProgress = progress;
+      lastMessage = message;
+      lastState = state;
+      lastEventFingerprint = eventFingerprint;
+    } else if (Date.now() - lastActivityAt > STALL_NO_ACTIVITY_MS) {
+      throw new Error(
+        "Task appears stalled (no status/event changes for several minutes). Retry with Safe preset or Force CPU Mode."
+      );
+    } else if (Date.now() - lastHeartbeatLogAt > NO_EVENT_HEARTBEAT_MS) {
+      const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+      appendConsole(`Still processing... (${elapsedSec}s elapsed, no new worker events yet).`);
+      lastHeartbeatLogAt = Date.now();
+    }
+
+    if (payload.status === "done") {
+      showProgress(100, "Decomposition complete.");
+      renderResults(payload);
+      setStatus("Layers are ready. Preview and download below.");
+      appendConsole("Task completed successfully.");
+      return;
+    }
+
+    if (payload.status === "error") {
+      throw new Error(payload.error || "Task failed");
     }
 
     await sleep(POLL_INTERVAL_MS);
   }
 
   throw new Error(
-    "Processing is still running (first model download can take several minutes). Please retry in a moment."
+    "Task timed out without completion. Try Safe preset + Force CPU Mode, then check worker logs."
   );
 }
 
